@@ -1,3 +1,3 @@
 # NicetOS
 This project is based on Ubuntu.
-there's nothing
+A child-safe operating system

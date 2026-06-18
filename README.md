@@ -1,5 +1,5 @@
 # NicetOS
-A child-safe operating system based on Ubuntu LTS.
+> A child-safe operating system based on Ubuntu LTS.
 
 ## About
 NicetOS (Nice + Protect + OS) is a Linux distribution based on Ubuntu LTS, designed to provide a safer digital environment for children and teenagers.

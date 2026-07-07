@@ -1,7 +1,7 @@
 # 導入函式庫
 import json
 
-# 拆解網址
+# 拆解網址：分成網域、路徑、參數等
 from urllib.parse import urlparse
 
 def extract_domain(input_link: str) -> str:

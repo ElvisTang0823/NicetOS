@@ -1,6 +1,15 @@
 # 導入函式庫
 import json
 
+# 拆解網址
+from urllib.parse import urlparse
+
+def extract_domain(input_link: str) -> str:
+    if '://' not in input_link:
+        input_link = 'http://' + input_link
+    netloc = urlparse(input_link).netloc
+    return netloc.split(':')[0].rstrip('.')
+
 # ======1====================
 # 讀取白名單
 with open('data/whitelist.json', 'r', encoding='utf-8') as file:

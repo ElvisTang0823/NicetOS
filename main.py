@@ -1,7 +1,7 @@
 # 導入函式庫
 import json
 
-# ==========================
+# ======1====================
 # 讀取白名單
 with open('data/whitelist.json', 'r', encoding='utf-8') as file:
     whitelist = json.load(file)

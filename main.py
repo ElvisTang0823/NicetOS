@@ -1,6 +1,6 @@
 # 導入函式庫
 import json
-import re
+import os
 from urllib.parse import urlparse
 
 from hash import get_stable_hash
@@ -20,12 +20,27 @@ def extract_domain(input_link: str) -> str:
     return domain
 
 
+def load_hash_map(filepath: str) -> dict[str, list[str]]:
+    if not os.path.exists(filepath):
+        return {}
+
+    with open(filepath, 'r', encoding='utf-8') as file:
+        data = json.load(file)
+
+    normalized = {}
+    for key, value in data.items():
+        normalized[str(key)] = value if isinstance(value, list) else [value]
+    return normalized
+
+
+def domain_in_bucket(bucket: list[str], domain: str) -> bool:
+    return domain in bucket
+
+
 # ===========================
 # 讀取白名單 / 黑名單
-with open('data/whitelist.json', 'r', encoding='utf-8') as file:
-    whitelist = json.load(file)
-with open('data/blacklist.json', 'r', encoding='utf-8') as file:
-    blacklist = json.load(file)
+whitelist = load_hash_map('data/whitelist.json')
+blacklist = load_hash_map('data/blacklist.json')
 
 
 # ==========================
@@ -34,23 +49,27 @@ with open('data/blacklist.json', 'r', encoding='utf-8') as file:
 # 回傳 False => 黑名單
 # 回傳 0 => 未命中，交由 Go 或 SLM 判斷
 # ==========================
-def get_hash_key(input_link: str) -> str:
-    domain = extract_domain(input_link)
+def get_hash_key(domain: str) -> str:
     if not domain:
         return ""
     return str(get_stable_hash(domain, HASH_CAPACITY))
 
 
 def check_url(input_link):
-    hash_key = get_hash_key(input_link)
+    domain = extract_domain(input_link)
+    if not domain:
+        return 0
+
+    hash_key = get_hash_key(domain)
     if not hash_key:
         return 0
 
-    # 黑名單優先，避免同時存在於兩邊時被白名單覆蓋
-    if hash_key in blacklist:
+    if hash_key in blacklist and domain_in_bucket(blacklist[hash_key], domain):
         return False
-    if hash_key in whitelist:
+
+    if hash_key in whitelist and domain_in_bucket(whitelist[hash_key], domain):
         return True
+
     return 0
 
 

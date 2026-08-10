@@ -13,12 +13,17 @@ HASH_CAPACITY = 142867
 def extract_domain(input_link: str) -> str:
     if '://' not in input_link:
         input_link = 'http://' + input_link
-    netloc = urlparse(input_link).netloc
-    domain = netloc.split(':')[0].rstrip('.')
-    if domain.startswith('www.'):
-        domain = domain[4:]
-    return domain
-
+    hostname = urlparse(input_link).hostname 
+    if hostname is None:
+        return '' 
+    hostname = hostname.rstrip('.')
+    try:
+        hostname = hostname.encode('idna').decode('ascii')
+    except UnicodeError:
+        return ''
+    if hostname.startswith('www.'):
+        hostname = hostname[4:]
+    return hostname
 
 def load_hash_map(filepath: str) -> dict[str, list[str]]:
     if not os.path.exists(filepath):
@@ -78,3 +83,4 @@ def check_url(input_link):
 if __name__ == '__main__':
     result = check_url(str(input("請輸入網址: ")))  # 到時候改由 Go 傳入資料
     print(result)
+

@@ -8,7 +8,10 @@ def extract_domain(input_link: str) -> str:
     if '://' not in input_link:
         input_link = 'http://' + input_link
     netloc = urlparse(input_link).netloc
-    return netloc.split(':')[0].rstrip('.')
+    domain = netloc.split(':')[0].rstrip('.')
+    if domain.startswith('www.'):
+        domain = domain[4:]
+    return domain
 
 # ===========================
 # 讀取白名單

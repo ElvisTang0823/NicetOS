@@ -77,7 +77,6 @@ def check_url(input_link):
 
     return 0
 
-
 # ==========================
 # 直接開檔案測試
 if __name__ == '__main__':

@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>存取受限</title>
+<style>
+  :root {
+    --ink: #0f1720;
+    --panel: #141d29;
+    --line: #2a3644;
+    --paper: #eef1f4;
+    --warn: #e8a33d;
+    --warn-dim: #a97527;
+    --muted: #7c8798;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: var(--ink);
+    color: var(--paper);
+    font-family: "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", -apple-system, sans-serif;
+  }
+
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+
+  .frame {
+    width: 100%;
+    max-width: 560px;
+    border: 1px solid var(--line);
+    background: var(--panel);
+    padding: 48px 44px 40px;
+    position: relative;
+  }
+
+  .frame::before {
+    content: "";
+    position: absolute;
+    top: 0; left: 0;
+    width: 40px; height: 3px;
+    background: var(--warn);
+  }
+
+  .code {
+    font-family: "JetBrains Mono", "Courier New", monospace;
+    font-size: 13px;
+    letter-spacing: 0.06em;
+    color: var(--warn);
+    margin: 0 0 20px;
+  }
+
+  h1 {
+    font-family: Georgia, "Noto Serif TC", serif;
+    font-size: 32px;
+    line-height: 1.35;
+    font-weight: 600;
+    margin: 0 0 18px;
+    color: var(--paper);
+  }
+
+  p.desc {
+    font-size: 15px;
+    line-height: 1.8;
+    color: var(--muted);
+    margin: 0 0 28px;
+    max-width: 46ch;
+  }
+
+  .divider {
+    height: 1px;
+    background: var(--line);
+    margin: 0 0 24px;
+  }
+
+  .detail-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    font-size: 13px;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .detail-row:last-of-type {
+    border-bottom: none;
+  }
+
+  .detail-row .k {
+    color: var(--muted);
+  }
+
+  .detail-row .v {
+    color: var(--paper);
+    text-align: right;
+    word-break: break-all;
+    font-family: "JetBrains Mono", "Courier New", monospace;
+  }
+
+  .actions {
+    margin-top: 32px;
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  button, a.btn {
+    font-family: inherit;
+    font-size: 14px;
+    padding: 11px 20px;
+    border: 1px solid var(--line);
+    background: transparent;
+    color: var(--paper);
+    cursor: pointer;
+    text-decoration: none;
+    transition: border-color 0.15s ease, color 0.15s ease;
+  }
+
+  button:hover, a.btn:hover {
+    border-color: var(--warn);
+    color: var(--warn);
+  }
+
+  button.primary {
+    background: var(--warn);
+    border-color: var(--warn);
+    color: #1a1204;
+  }
+
+  button.primary:hover {
+    background: var(--warn-dim);
+    border-color: var(--warn-dim);
+    color: var(--paper);
+  }
+
+  .footnote {
+    margin-top: 28px;
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.6;
+  }
+
+  @media (max-width: 480px) {
+    .frame { padding: 36px 24px 28px; }
+    h1 { font-size: 26px; }
+    .detail-row { flex-direction: column; gap: 4px; }
+    .detail-row .v { text-align: left; }
+  }
+</style>
+</head>
+<body>
+
+  <div class="frame">
+    <p class="code">存取限制 · 代碼 403</p>
+    <h1>此網站已依政策封鎖</h1>
+    <p class="desc">
+      您嘗試造訪的網址不符合目前網路的使用規範,系統已自動阻擋此次連線。
+      若您認為這是誤判,可以透過下方管道提出申請解除。
+    </p>
+
+    <div class="divider"></div>
+
+    <div class="detail-row">
+      <span class="k">封鎖網址</span>
+      <span class="v" id="blockedUrl">example.com</span>
+    </div>
+    <div class="detail-row">
+      <span class="k">封鎖原因</span>
+      <span class="v">內容分類限制</span>
+    </div>
+    <div class="detail-row">
+      <span class="k">時間</span>
+      <span class="v" id="blockedTime">—</span>
+    </div>
+
+    <div class="actions">
+      <button class="primary" onclick="history.back()">返回上一頁</button>
+      <a class="btn" href="mailto:admin@example.com?subject=網站封鎖申訴">申請解除封鎖</a>
+    </div>
+
+    <p class="footnote">
+      如需協助,請聯絡系統管理員。此頁面由網路存取控管系統自動產生。
+    </p>
+  </div>
+
+  <script>
+    // 若網址中帶有 ?url= 參數，顯示實際被封鎖的網址
+    const params = new URLSearchParams(window.location.search);
+    const targetUrl = params.get('url');
+    if (targetUrl) {
+      document.getElementById('blockedUrl').textContent = targetUrl;
+    }
+
+    // 顯示封鎖時間
+    const now = new Date();
+    document.getElementById('blockedTime').textContent = now.toLocaleString('zh-TW', {
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit'
+    });
+  </script>
+
+</body>
+</html>

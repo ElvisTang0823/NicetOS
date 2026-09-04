@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>此網頁已被NicetOS封鎖</title>
+<style>
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #a01d1d;
+    font-family: "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", Arial, sans-serif;
+  }
+
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+
+  .panel {
+    width: 100%;
+    max-width: 560px;
+    color: #ffffff;
+  }
+
+  .icon {
+    width: 64px;
+    height: 64px;
+    background: #ffffff;
+    clip-path: polygon(30% 0%, 70% 0%, 100% 30%, 100% 70%, 70% 100%, 30% 100%, 0% 70%, 0% 30%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 32px;
+    position: relative;
+  }
+
+  .icon::before, .icon::after {
+    content: "";
+    position: absolute;
+    width: 30px;
+    height: 5px;
+    background: #a01d1d;
+    border-radius: 2px;
+  }
+
+  .icon::before { transform: rotate(45deg); }
+  .icon::after { transform: rotate(-45deg); }
+
+  h1 {
+    font-size: 32px;
+    font-weight: 700;
+    margin: 0 0 20px;
+  }
+
+  p.desc {
+    font-size: 20px;
+    line-height: 1.8;
+    margin: 0 0 24px;
+    color: #f8e2e2;
+  }
+
+  .actions {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-top: 8px;
+  }
+
+  .safety {
+    font-family: inherit;
+    font-size: 16px;
+    padding: 11px 24px;
+    border-radius: 22px;
+    cursor: pointer;
+    background: #ffffff;
+    border: 1px solid #ffffff;
+    color: #a01d1d;
+    font-weight: 600;
+    text-decoration: none;
+    display: inline-block;
+  }
+
+  .safety:hover {
+    background: #f2f2f2;
+  }
+</style>
+</head>
+<body>
+
+  <div class="panel">
+    <div class="icon"></div>
+
+    <h1>危險網站</h1>
+
+    <p class="desc">
+      此網站的內容不符合兒少上網安全規範，系統已依家長監護設定將其封鎖。
+      如需調整權限，請洽詢家長或監護人。
+    </p>
+  </div>
+
+</body>
+</html>

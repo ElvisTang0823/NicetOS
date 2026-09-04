@@ -3,7 +3,10 @@ import json
 import os
 from urllib.parse import urlparse
 
-from hash import get_stable_hash
+try:
+    from hash import get_stable_hash
+except ModuleNotFoundError:
+    from python.hash import get_stable_hash
 
 HASH_CAPACITY = 142867
 

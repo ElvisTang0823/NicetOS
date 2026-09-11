@@ -4,6 +4,7 @@ package proxy
 
 import (
 	"fmt"
+	"log"
 	"os/exec"
 	"strings"
 )
@@ -15,6 +16,8 @@ func configurePlatformProxy(address string) (func() error, error) {
 	if err != nil {
 		return nil, err
 	}
+	
+	// 讀取當前設定
 	oldEnable, enableExists, err := readRegistryValue("ProxyEnable")
 	if err != nil {
 		return nil, err
@@ -23,18 +26,50 @@ func configurePlatformProxy(address string) (func() error, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := registryCommand("add", internetSettingsKey, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "1", "/f"); err != nil {
-		return nil, err
-	}
-	if err := registryCommand("add", internetSettingsKey, "/v", "ProxyServer", "/t", "REG_SZ", "/d", "127.0.0.1:"+port, "/f"); err != nil {
-		return nil, err
-	}
-
-	return func() error {
-		if err := restoreRegistryValue("ProxyEnable", oldEnable, enableExists, "REG_DWORD"); err != nil {
-			return err
+	
+	currentAddress := "127.0.0.1:" + port
+	wasCleaned := false
+	
+	// 若發現遺留的舊代理設定（前次程序崩潰時的殘留），清除它們
+	if enableExists && oldEnable == "1" && serverExists && oldServer != currentAddress {
+		log.Printf("[PROXY-WIN] Detected leftover proxy settings: %s (expected: %s), cleaning up", oldServer, currentAddress)
+		if err := registryCommand("delete", internetSettingsKey, "/v", "ProxyEnable", "/f"); err == nil {
+			log.Println("[PROXY-WIN] Cleaned ProxyEnable")
 		}
-		return restoreRegistryValue("ProxyServer", oldServer, serverExists, "REG_SZ")
+		if err := registryCommand("delete", internetSettingsKey, "/v", "ProxyServer", "/f"); err == nil {
+			log.Println("[PROXY-WIN] Cleaned ProxyServer")
+		}
+		wasCleaned = true
+		enableExists = false
+		serverExists = false
+	}
+	
+	// 設置新的代理
+	log.Printf("[PROXY-WIN] Setting proxy to %s", currentAddress)
+	if err := registryCommand("add", internetSettingsKey, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "1", "/f"); err != nil {
+		return nil, fmt.Errorf("failed to set ProxyEnable: %w", err)
+	}
+	if err := registryCommand("add", internetSettingsKey, "/v", "ProxyServer", "/t", "REG_SZ", "/d", currentAddress, "/f"); err != nil {
+		return nil, fmt.Errorf("failed to set ProxyServer: %w", err)
+	}
+	log.Println("[PROXY-WIN] Proxy settings applied")
+
+	// 返回恢復函數
+	return func() error {
+		log.Println("[PROXY-WIN] Restoring proxy settings...")
+		if wasCleaned {
+			// 若之前清除過遺留設定，恢復時也不需特殊處理
+			log.Println("[PROXY-WIN] Previously cleaned settings, nothing to restore")
+			return nil
+		}
+		if err := restoreRegistryValue("ProxyEnable", oldEnable, enableExists, "REG_DWORD"); err != nil {
+			return fmt.Errorf("failed to restore ProxyEnable: %w", err)
+		}
+		if err := restoreRegistryValue("ProxyServer", oldServer, serverExists, "REG_SZ"); err != nil {
+			return fmt.Errorf("failed to restore ProxyServer: %w", err)
+		}
+		log.Println("[PROXY-WIN] Proxy settings restored")
+		return nil
 	}, nil
 }
 
@@ -74,8 +109,10 @@ func readRegistryValue(name string) (string, bool, error) {
 }
 
 func restoreRegistryValue(name, value string, exists bool, valueType string) error {
-	if !exists {
-		return nil
+	if exists {
+		// 值原本存在，恢復原值
+		return registryCommand("add", internetSettingsKey, "/v", name, "/t", valueType, "/d", value, "/f")
 	}
-	return registryCommand("add", internetSettingsKey, "/v", name, "/t", valueType, "/d", value, "/f")
+	// 值原本不存在，刪除新添加的值
+	return registryCommand("delete", internetSettingsKey, "/v", name, "/f")
 }

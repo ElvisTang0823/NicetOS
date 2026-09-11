@@ -47,8 +47,12 @@ def domain_in_bucket(bucket: list[str], domain: str) -> bool:
 
 # ===========================
 # 讀取白名單 / 黑名單
-whitelist = load_hash_map('data/whitelist.json')
-blacklist = load_hash_map('data/blacklist.json')
+# 以 main.py 自身所在目錄為資料根，不再依賴執行時的工作目錄
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, 'data')
+
+whitelist = load_hash_map(os.path.join(DATA_DIR, 'whitelist.json'))
+blacklist = load_hash_map(os.path.join(DATA_DIR, 'blacklist.json'))
 
 
 # ==========================

@@ -28,27 +28,54 @@ type siteChecker struct {
 	mu     sync.Mutex
 }
 
+func choosePythonInvocation(python string, target string) (string, []string) {
+	code := "import main; print(main.check_url(__import__('sys').argv[1]))"
+	python = strings.TrimSpace(python)
+	if python == "" {
+		python = "python"
+	}
+
+	base := strings.ToLower(filepath.Base(python))
+	if base == "py" || base == "py.exe" {
+		return "py", []string{"-3", "-c", code, target}
+	}
+	if base == "python" || base == "python.exe" {
+		return "python", []string{"-c", code, target}
+	}
+	return python, []string{"-c", code, target}
+}
+
 func (checker *siteChecker) Check(target string) (bool, error) {
 	checker.mu.Lock()
 	defer checker.mu.Unlock()
 
-	command := exec.Command(checker.python, "-c", "import main; print(main.check_url(__import__('sys').argv[1]))", target)
-	command.Dir = checker.root
-	command.Env = append(os.Environ(), "PYTHONPATH="+filepath.Join(checker.root, "python"))
-	output, err := command.Output()
-	if err != nil {
-		log.Printf("[CHECK] Python error for %s: %v (stderr: %s)", target, err, command.Stderr)
-		return false, fmt.Errorf("main.py check failed: %w", err)
+	candidates := []string{checker.python}
+	if checker.python == "" || checker.python == "python" || strings.EqualFold(filepath.Base(checker.python), "python") || strings.EqualFold(filepath.Base(checker.python), "python.exe") {
+		candidates = append(candidates, "py")
 	}
 
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	if len(lines) == 0 {
-		return false, errors.New("main.py returned no result")
+	var lastErr error
+	for _, candidate := range candidates {
+		commandName, commandArgs := choosePythonInvocation(candidate, target)
+		command := exec.Command(commandName, commandArgs...)
+		command.Dir = checker.root
+		command.Env = append(os.Environ(), "PYTHONPATH="+filepath.Join(checker.root, "python"))
+		output, err := command.Output()
+		if err == nil {
+			lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+			if len(lines) == 0 {
+				return false, errors.New("main.py returned no result")
+			}
+			lastLine := strings.TrimSpace(lines[len(lines)-1])
+			result := lastLine != "False"
+			log.Printf("[CHECK] %s -> Python: %s -> Go: %v", target, lastLine, result)
+			return result, nil
+		}
+		lastErr = err
+		log.Printf("[CHECK] Python error for %s: %v (falling back if needed)", target, err)
 	}
-	lastLine := strings.TrimSpace(lines[len(lines)-1])
-	result := lastLine != "False"
-	log.Printf("[CHECK] %s -> Python: %s -> Go: %v", target, lastLine, result)
-	return result, nil
+
+	return false, fmt.Errorf("main.py check failed: %w", lastErr)
 }
 
 func proxyRoot() (string, error) {

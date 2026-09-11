@@ -37,6 +37,7 @@ func (checker *siteChecker) Check(target string) (bool, error) {
 	command.Env = append(os.Environ(), "PYTHONPATH="+filepath.Join(checker.root, "python"))
 	output, err := command.Output()
 	if err != nil {
+		log.Printf("[CHECK] Python error for %s: %v (stderr: %s)", target, err, command.Stderr)
 		return false, fmt.Errorf("main.py check failed: %w", err)
 	}
 
@@ -44,7 +45,10 @@ func (checker *siteChecker) Check(target string) (bool, error) {
 	if len(lines) == 0 {
 		return false, errors.New("main.py returned no result")
 	}
-	return strings.TrimSpace(lines[len(lines)-1]) != "False", nil
+	lastLine := strings.TrimSpace(lines[len(lines)-1])
+	result := lastLine != "False"
+	log.Printf("[CHECK] %s -> Python: %s -> Go: %v", target, lastLine, result)
+	return result, nil
 }
 
 func proxyRoot() (string, error) {
@@ -52,20 +56,46 @@ func proxyRoot() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Dir(filepath.Clean(executable)), nil
+	// executable 可能在 go/ 目錄內（e.g., e:\NicetOS\go\NicetOS-windows-amd64.exe）
+	// 或根目錄（e.g., e:\NicetOS\main 在 go run . 時）
+	// 先檢查是否 main.py 在當前目錄，若沒有則往上一層找
+	exeDir := filepath.Dir(filepath.Clean(executable))
+	if _, err := os.Stat(filepath.Join(exeDir, "main.py")); err == nil {
+		return exeDir, nil
+	}
+	// 若 main.py 不在 exe 目錄，試試父目錄
+	parentDir := filepath.Dir(exeDir)
+	if _, err := os.Stat(filepath.Join(parentDir, "main.py")); err == nil {
+		return parentDir, nil
+	}
+	// 都找不到，就用 exe 所在目錄
+	return exeDir, nil
 }
 
 func main() {
 	flag.Parse()
+	log.Printf("Starting NicetOS proxy on %s", *listenAddress)
+	
 	root, err := proxyRoot()
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to determine proxy root: %v", err)
 	}
+	log.Printf("Proxy root directory: %s", root)
 
 	server, err := proxy.StartTransparentProxy(*listenAddress, &siteChecker{python: *pythonCommand, root: root})
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to start proxy: %v", err)
 	}
+	log.Println("Proxy started successfully")
+	
+	// 立即註冊清理，即使程序崩潰也能恢復系統設定
+	defer func() {
+		log.Println("cleaning up proxy settings")
+		if closeErr := server.Close(); closeErr != nil {
+			log.Printf("error closing server: %v", closeErr)
+		}
+	}()
+
 	shutdown := make(chan os.Signal, 1)
 	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -76,6 +106,6 @@ func main() {
 
 	log.Printf("NicetOS transparent proxy listening on %s; press Ctrl+C to stop", *listenAddress)
 	if err := server.Serve(); err != nil && !errors.Is(err, net.ErrClosed) {
-		log.Fatal(err)
+		log.Fatalf("Proxy serve error: %v", err)
 	}
 }

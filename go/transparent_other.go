@@ -4,6 +4,7 @@ package proxy
 
 import (
 	"io"
+	"log"
 	"net"
 	"net/http"
 )
@@ -31,15 +32,24 @@ func StartTransparentProxy(address string, checker URLChecker) (*TransparentProx
 		if request.Method == http.MethodConnect {
 			target = "https://" + request.Host
 		}
+		log.Printf("[PROXY] Checking: %s", target)
 		allowed, checkErr := checker.Check(target)
 		if checkErr != nil {
-			http.Error(response, "site check unavailable", http.StatusServiceUnavailable)
+			log.Printf("[PROXY] Check error for %s: %v (allowing due to error)", target, checkErr)
+			// 錯誤時安全預設：允許通過，避免完全斷網
+			if request.Method == http.MethodConnect {
+				handleBasicConnect(response, request)
+				return
+			}
+			handleBasicHTTP(response, request)
 			return
 		}
 		if !allowed {
+			log.Printf("[PROXY] BLOCKED: %s (blacklist)", target)
 			http.Error(response, "access denied by NicetOS", http.StatusForbidden)
 			return
 		}
+		log.Printf("[PROXY] ALLOWED: %s", target)
 		if request.Method == http.MethodConnect {
 			handleBasicConnect(response, request)
 			return
@@ -56,10 +66,21 @@ func (proxy *TransparentProxy) Serve() error {
 }
 
 func (proxy *TransparentProxy) Close() error {
+	log.Println("[PROXY] Closing proxy server")
 	err := proxy.server.Close()
-	if restoreErr := proxy.restore(); err == nil {
-		err = restoreErr
+	if err != nil {
+		log.Printf("[PROXY] Server close error: %v", err)
 	}
+	
+	// 無論伺服器是否正常關閉，都要嘗試恢復系統設定
+	restoreErr := proxy.restore()
+	if restoreErr != nil {
+		log.Printf("[PROXY] Settings restore error: %v", restoreErr)
+		if err == nil {
+			err = restoreErr
+		}
+	}
+	
 	close(proxy.done)
 	return err
 }

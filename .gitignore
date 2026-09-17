@@ -1,1 +1,5 @@
 ubuntu-24.04.4-desktop-amd64.iso
+
+# python快取檔案
+__pycache__/
+python/__pycache__/

@@ -5,6 +5,7 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -46,8 +47,14 @@ func StartTransparentProxy(address string, checker URLChecker) (*TransparentProx
 		_ = removeFirewall(chain)
 		return nil, err
 	}
-	proxy := &TransparentProxy{listener: listener, chain: chain, done: make(chan struct{})}
-	go proxy.acceptLoop(checker)
+	ca, err := newCertificateAuthority(checker)
+	if err != nil {
+		_ = listener.Close()
+		_ = removeFirewall(chain)
+		return nil, err
+	}
+	proxy := &TransparentProxy{listener: listener, chain: chain, done: make(chan struct{}), ca: ca}
+	go proxy.acceptLoop(checker, ca)
 	return proxy, nil
 }
 
@@ -66,17 +73,17 @@ func (proxy *TransparentProxy) Close() error {
 	return firewallErr
 }
 
-func (proxy *TransparentProxy) acceptLoop(checker URLChecker) {
+func (proxy *TransparentProxy) acceptLoop(checker URLChecker, ca *certificateAuthority) {
 	for {
 		connection, err := proxy.listener.Accept()
 		if err != nil {
 			return
 		}
-		go handleTransparentConnection(connection, checker)
+		go handleTransparentConnection(connection, checker, ca)
 	}
 }
 
-func handleTransparentConnection(connection net.Conn, checker URLChecker) {
+func handleTransparentConnection(connection net.Conn, checker URLChecker, ca *certificateAuthority) {
 	defer connection.Close()
 	original, err := originalDestination(connection)
 	if err != nil {
@@ -89,7 +96,7 @@ func handleTransparentConnection(connection net.Conn, checker URLChecker) {
 		return
 	}
 	if firstByte[0] == 0x16 {
-		handleTLSConnection(connection, reader, original, checker)
+		handleTLSConnection(connection, reader, original, checker, ca)
 		return
 	}
 	handleHTTPConnection(connection, reader, original, checker)
@@ -107,7 +114,7 @@ func handleHTTPConnection(connection net.Conn, reader *bufio.Reader, original st
 	target := "http://" + host + request.URL.RequestURI()
 	allowed, err := checker.Check(target)
 	if err != nil || !allowed {
-		writeProxyError(connection, http.StatusForbidden, "access denied by NicetOS")
+		writeBlockedPage(connection, checker)
 		return
 	}
 
@@ -127,7 +134,7 @@ func handleHTTPConnection(connection net.Conn, reader *bufio.Reader, original st
 	_ = response.Write(connection)
 }
 
-func handleTLSConnection(connection net.Conn, reader *bufio.Reader, original string, checker URLChecker) {
+func handleTLSConnection(connection net.Conn, reader *bufio.Reader, original string, checker URLChecker, ca *certificateAuthority) {
 	clientHello, err := readClientHello(reader)
 	if err != nil {
 		return
@@ -135,10 +142,16 @@ func handleTLSConnection(connection net.Conn, reader *bufio.Reader, original str
 	host := tlsServerName(clientHello)
 	if host == "" {
 		log.Printf("blocked HTTPS connection without server name to %s", original)
+		if err := serveBlockedTLSPage(connection, reader, checker, original, ca); err != nil {
+			log.Printf("failed to render blocked TLS page for %s: %v", original, err)
+		}
 		return
 	}
 	allowed, err := checker.Check("https://" + host)
 	if err != nil || !allowed {
+		if err := serveBlockedTLSPage(connection, reader, checker, host, ca); err != nil {
+			log.Printf("failed to render blocked TLS page for %s: %v", host, err)
+		}
 		return
 	}
 	upstream, err := net.DialTimeout("tcp", original, 10*time.Second)
@@ -148,6 +161,25 @@ func handleTLSConnection(connection net.Conn, reader *bufio.Reader, original str
 	defer upstream.Close()
 	go io.Copy(upstream, reader)
 	_, _ = io.Copy(connection, upstream)
+}
+
+func serveBlockedTLSPage(connection net.Conn, reader *bufio.Reader, checker URLChecker, host string, ca *certificateAuthority) error {
+	body, err := readBlockedPageBody(checker)
+	if err != nil {
+		return err
+	}
+	config, err := ca.tlsConfig(host)
+	if err != nil {
+		return err
+	}
+	tlsConn := tls.Server(&readerConn{Conn: connection, reader: reader}, config)
+	if err := tlsConn.Handshake(); err != nil {
+		return err
+	}
+	defer tlsConn.Close()
+	response := fmt.Sprintf("HTTP/1.1 403 Forbidden\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+	_, err = tlsConn.Write([]byte(response))
+	return err
 }
 
 func readClientHello(reader *bufio.Reader) ([]byte, error) {
@@ -214,6 +246,18 @@ func tlsServerName(record []byte) string {
 		position += extensionLength
 	}
 	return ""
+}
+
+func writeBlockedPage(connection net.Conn, checker URLChecker) {
+	pagePath := checker.BlockedPagePath()
+	body, err := os.ReadFile(pagePath)
+	if err != nil {
+		log.Printf("[PROXY] Failed to read blocked page %s: %v", pagePath, err)
+		writeProxyError(connection, http.StatusForbidden, "access denied by NicetOS")
+		return
+	}
+
+	_, _ = fmt.Fprintf(connection, "HTTP/1.1 %d %s\r\nConnection: close\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\n\r\n%s", http.StatusForbidden, http.StatusText(http.StatusForbidden), len(body), string(body))
 }
 
 func writeProxyError(connection net.Conn, status int, message string) {

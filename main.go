@@ -1,54 +1,247 @@
 package main
 
 import (
+	"context"
+	"crypto/md5"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"math/big"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	proxy "nicetos/go"
 )
 
 var (
 	listenAddress = flag.String("listen", "127.0.0.1:8080", "proxy listen address")
-	pythonCommand = flag.String("python", "python", "Python executable")
 )
 
+const hashCapacity = 142867
+
+var listURLs = map[string]string{
+	"blacklist": "https://raw.githubusercontent.com/ElvisTang0823/NicetOS/main/data/blacklist.json",
+	"whitelist": "https://raw.githubusercontent.com/ElvisTang0823/NicetOS/main/data/whitelist.json",
+}
+
+type domainLists struct {
+	blacklist map[string][]string
+	whitelist map[string][]string
+}
+
 type siteChecker struct {
-	python string
-	root   string
-	mu     sync.Mutex
+	root     string
+	urls     map[string]string
+	client   *http.Client
+	lists    atomic.Pointer[domainLists]
+	updateMu sync.Mutex
+}
+
+func (checker *siteChecker) BlockedPagePath() string {
+	return filepath.Join(checker.root, "assets", "index.html")
+}
+
+func newSiteChecker(root string) *siteChecker {
+	checker := &siteChecker{
+		root:   root,
+		urls:   listURLs,
+		client: &http.Client{Timeout: 10 * time.Second},
+	}
+	checker.lists.Store(&domainLists{blacklist: map[string][]string{}, whitelist: map[string][]string{}})
+	return checker
 }
 
 func (checker *siteChecker) Check(target string) (bool, error) {
-	checker.mu.Lock()
-	defer checker.mu.Unlock()
+	domain := extractDomain(target)
+	if domain == "" {
+		return true, nil
+	}
+	lists := checker.lists.Load()
+	if lists == nil {
+		return true, errors.New("domain lists are not loaded")
+	}
+	key := domainHashKey(domain)
+	for _, blocked := range lists.blacklist[key] {
+		if blocked == domain {
+			return false, nil
+		}
+	}
+	return true, nil
+}
 
-	command := exec.Command(checker.python, "-c", "import main; print(main.check_url(__import__('sys').argv[1]))", target)
-	command.Dir = checker.root
-	command.Env = append(os.Environ(), "PYTHONPATH="+filepath.Join(checker.root, "python"))
-	output, err := command.Output()
+func extractDomain(target string) string {
+	if !strings.Contains(target, "://") {
+		target = "http://" + target
+	}
+	parsed, err := url.Parse(target)
 	if err != nil {
-		log.Printf("[CHECK] Python error for %s: %v (stderr: %s)", target, err, command.Stderr)
-		return false, fmt.Errorf("main.py check failed: %w", err)
+		return ""
 	}
+	domain := strings.TrimSuffix(parsed.Hostname(), ".")
+	if strings.HasPrefix(domain, "www.") {
+		domain = domain[4:]
+	}
+	return domain
+}
 
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	if len(lines) == 0 {
-		return false, errors.New("main.py returned no result")
+func domainHashKey(domain string) string {
+	digest := md5.Sum([]byte(domain))
+	value := new(big.Int).SetBytes(digest[:])
+	return new(big.Int).Mod(value, big.NewInt(hashCapacity)).String()
+}
+
+func (checker *siteChecker) loadListsFromDisk() error {
+	blacklist, err := loadHashMap(filepath.Join(checker.root, "data", "blacklist.json"))
+	if err != nil {
+		return fmt.Errorf("load blacklist: %w", err)
 	}
-	lastLine := strings.TrimSpace(lines[len(lines)-1])
-	result := lastLine != "False"
-	log.Printf("[CHECK] %s -> Python: %s -> Go: %v", target, lastLine, result)
+	whitelist, err := loadHashMap(filepath.Join(checker.root, "data", "whitelist.json"))
+	if err != nil {
+		return fmt.Errorf("load whitelist: %w", err)
+	}
+	checker.lists.Store(&domainLists{blacklist: blacklist, whitelist: whitelist})
+	return nil
+}
+
+func loadHashMap(path string) (map[string][]string, error) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(contents, &raw); err != nil {
+		return nil, err
+	}
+	result := make(map[string][]string, len(raw))
+	for key, value := range raw {
+		var entries []string
+		if err := json.Unmarshal(value, &entries); err != nil {
+			var entry string
+			if err := json.Unmarshal(value, &entry); err != nil {
+				return nil, fmt.Errorf("invalid entry for hash %s", key)
+			}
+			entries = []string{entry}
+		}
+		result[key] = entries
+	}
 	return result, nil
+}
+
+func (checker *siteChecker) startListRefresh(stop <-chan struct{}) {
+	go func() {
+		checker.refreshLists(context.Background())
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				checker.refreshLists(context.Background())
+			}
+		}
+	}()
+}
+
+func (checker *siteChecker) refreshLists(ctx context.Context) {
+	checker.updateMu.Lock()
+	defer checker.updateMu.Unlock()
+	type fetchedList struct {
+		name    string
+		entries map[string][]string
+		err     error
+	}
+	results := make(chan fetchedList, len(checker.urls))
+	for name, sourceURL := range checker.urls {
+		go func(name, sourceURL string) {
+			entries, err := checker.fetchHashMap(ctx, sourceURL)
+			results <- fetchedList{name: name, entries: entries, err: err}
+		}(name, sourceURL)
+	}
+	fetched := make(map[string]map[string][]string, len(checker.urls))
+	for range checker.urls {
+		result := <-results
+		if result.err != nil {
+			log.Printf("[LISTS] %s update failed: %v; keeping current lists", result.name, result.err)
+			return
+		}
+		fetched[result.name] = result.entries
+	}
+	for name, entries := range fetched {
+		if err := writeHashMap(filepath.Join(checker.root, "data", name+".json"), entries); err != nil {
+			log.Printf("[LISTS] %s download succeeded but could not save it: %v", name, err)
+			return
+		}
+	}
+	checker.lists.Store(&domainLists{blacklist: fetched["blacklist"], whitelist: fetched["whitelist"]})
+	log.Printf("[LISTS] blacklist and whitelist updated")
+}
+
+func (checker *siteChecker) fetchHashMap(ctx context.Context, sourceURL string) (map[string][]string, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	response, err := checker.client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected HTTP status %s", response.Status)
+	}
+	contents, err := io.ReadAll(io.LimitReader(response.Body, 32<<20))
+	if err != nil {
+		return nil, err
+	}
+	return parseHashMap(contents)
+}
+
+func parseHashMap(contents []byte) (map[string][]string, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(contents, &raw); err != nil {
+		return nil, err
+	}
+	result := make(map[string][]string, len(raw))
+	for key, value := range raw {
+		var entries []string
+		if err := json.Unmarshal(value, &entries); err != nil {
+			var entry string
+			if err := json.Unmarshal(value, &entry); err != nil {
+				return nil, fmt.Errorf("invalid entry for hash %s", key)
+			}
+			entries = []string{entry}
+		}
+		result[key] = entries
+	}
+	return result, nil
+}
+
+func writeHashMap(path string, entries map[string][]string) error {
+	contents, err := json.MarshalIndent(entries, "", "    ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	temporary := path + ".new"
+	if err := os.WriteFile(temporary, contents, 0644); err != nil {
+		return err
+	}
+	return os.Rename(temporary, path)
 }
 
 func proxyRoot() (string, error) {
@@ -75,19 +268,26 @@ func proxyRoot() (string, error) {
 func main() {
 	flag.Parse()
 	log.Printf("Starting NicetOS proxy on %s", *listenAddress)
-	
+
 	root, err := proxyRoot()
 	if err != nil {
 		log.Fatalf("Failed to determine proxy root: %v", err)
 	}
 	log.Printf("Proxy root directory: %s", root)
+	checker := newSiteChecker(root)
+	if err := checker.loadListsFromDisk(); err != nil {
+		log.Fatalf("Failed to load domain lists: %v", err)
+	}
+	listRefreshStop := make(chan struct{})
+	checker.startListRefresh(listRefreshStop)
+	defer close(listRefreshStop)
 
-	server, err := proxy.StartTransparentProxy(*listenAddress, &siteChecker{python: *pythonCommand, root: root})
+	server, err := proxy.StartTransparentProxy(*listenAddress, checker)
 	if err != nil {
 		log.Fatalf("Failed to start proxy: %v", err)
 	}
 	log.Println("Proxy started successfully")
-	
+
 	// 立即註冊清理，即使程序崩潰也能恢復系統設定
 	defer func() {
 		log.Println("cleaning up proxy settings")

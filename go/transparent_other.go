@@ -3,22 +3,24 @@
 package proxy
 
 import (
+	"bufio"
+	"crypto/tls"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
 )
-
-type TransparentProxy struct {
-	listener net.Listener
-	server   *http.Server
-	done     chan struct{}
-	restore  func() error
-}
 
 func StartTransparentProxy(address string, checker URLChecker) (*TransparentProxy, error) {
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
+		return nil, err
+	}
+	ca, err := newCertificateAuthority(checker)
+	if err != nil {
+		_ = listener.Close()
 		return nil, err
 	}
 	restore, err := configurePlatformProxy(address)
@@ -26,7 +28,13 @@ func StartTransparentProxy(address string, checker URLChecker) (*TransparentProx
 		_ = listener.Close()
 		return nil, err
 	}
-	proxy := &TransparentProxy{listener: listener, done: make(chan struct{}), restore: restore}
+	trustRestore, err := configureCertificateTrust(ca.certPath)
+	if err != nil {
+		_ = restore()
+		_ = listener.Close()
+		return nil, err
+	}
+	proxy := &TransparentProxy{listener: listener, done: make(chan struct{}), restore: restore, trustRestore: trustRestore, ca: ca}
 	proxy.server = &http.Server{Handler: http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		target := request.URL.String()
 		if request.Method == http.MethodConnect {
@@ -38,7 +46,7 @@ func StartTransparentProxy(address string, checker URLChecker) (*TransparentProx
 			log.Printf("[PROXY] Check error for %s: %v (allowing due to error)", target, checkErr)
 			// 錯誤時安全預設：允許通過，避免完全斷網
 			if request.Method == http.MethodConnect {
-				handleBasicConnect(response, request)
+				handleBasicConnect(response, request, checker)
 				return
 			}
 			handleBasicHTTP(response, request)
@@ -46,12 +54,16 @@ func StartTransparentProxy(address string, checker URLChecker) (*TransparentProx
 		}
 		if !allowed {
 			log.Printf("[PROXY] BLOCKED: %s (blacklist)", target)
-			http.Error(response, "access denied by NicetOS", http.StatusForbidden)
+			if request.Method == http.MethodConnect {
+				handleBlockedConnect(response, request, checker, ca)
+				return
+			}
+			serveBlockedPage(response, checker)
 			return
 		}
 		log.Printf("[PROXY] ALLOWED: %s", target)
 		if request.Method == http.MethodConnect {
-			handleBasicConnect(response, request)
+			handleBasicConnect(response, request, checker)
 			return
 		}
 		handleBasicHTTP(response, request)
@@ -71,7 +83,7 @@ func (proxy *TransparentProxy) Close() error {
 	if err != nil {
 		log.Printf("[PROXY] Server close error: %v", err)
 	}
-	
+
 	// 無論伺服器是否正常關閉，都要嘗試恢復系統設定
 	restoreErr := proxy.restore()
 	if restoreErr != nil {
@@ -80,9 +92,73 @@ func (proxy *TransparentProxy) Close() error {
 			err = restoreErr
 		}
 	}
-	
+	if proxy.trustRestore != nil {
+		if trustErr := proxy.trustRestore(); trustErr != nil {
+			log.Printf("[PROXY] CA trust restore error: %v", trustErr)
+			if err == nil {
+				err = trustErr
+			}
+		}
+	}
+
 	close(proxy.done)
 	return err
+}
+
+// handleBlockedConnect completes CONNECT first, then serves the block page over
+// TLS. Chromium otherwise replaces an HTTP CONNECT denial with its own error.
+func handleBlockedConnect(response http.ResponseWriter, request *http.Request, checker URLChecker, ca *certificateAuthority) {
+	hijacker, ok := response.(http.Hijacker)
+	if !ok {
+		http.Error(response, "CONNECT is not supported", http.StatusInternalServerError)
+		return
+	}
+	client, buffered, err := hijacker.Hijack()
+	if err != nil {
+		return
+	}
+	defer client.Close()
+	if _, err := client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		return
+	}
+	config, err := ca.tlsConfig(request.Host)
+	if err != nil {
+		log.Printf("[PROXY] Cannot create blocked-page certificate for %s: %v", request.Host, err)
+		return
+	}
+	tlsConnection := tls.Server(&readerConn{Conn: client, reader: buffered.Reader}, config)
+	if err := tlsConnection.Handshake(); err != nil {
+		log.Printf("[PROXY] TLS handshake for blocked %s failed: %v", request.Host, err)
+		return
+	}
+	defer tlsConnection.Close()
+	if _, err := http.ReadRequest(bufio.NewReader(tlsConnection)); err != nil {
+		return
+	}
+	writeBlockedHTTPResponse(tlsConnection, checker)
+}
+
+func writeBlockedHTTPResponse(writer io.Writer, checker URLChecker) {
+	body, err := readBlockedPageBody(checker)
+	if err != nil {
+		_, _ = io.WriteString(writer, "HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 24\r\n\r\naccess denied by NicetOS")
+		return
+	}
+	_, _ = fmt.Fprintf(writer, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+}
+
+func serveBlockedPage(response http.ResponseWriter, checker URLChecker) {
+	pagePath := checker.BlockedPagePath()
+	body, err := os.ReadFile(pagePath)
+	if err != nil {
+		log.Printf("[PROXY] Failed to read blocked page %s: %v", pagePath, err)
+		http.Error(response, "access denied by NicetOS", http.StatusForbidden)
+		return
+	}
+
+	response.Header().Set("Content-Type", "text/html; charset=utf-8")
+	response.WriteHeader(http.StatusForbidden)
+	_, _ = response.Write(body)
 }
 
 func handleBasicHTTP(response http.ResponseWriter, request *http.Request) {
@@ -102,7 +178,13 @@ func handleBasicHTTP(response http.ResponseWriter, request *http.Request) {
 	_, _ = io.Copy(response, upstream.Body)
 }
 
-func handleBasicConnect(response http.ResponseWriter, request *http.Request) {
+func handleBasicConnect(response http.ResponseWriter, request *http.Request, checker URLChecker) {
+	target := "https://" + request.Host
+	allowed, err := checker.Check(target)
+	if err != nil || !allowed {
+		serveBlockedPage(response, checker)
+		return
+	}
 	upstream, err := net.Dial("tcp", request.Host)
 	if err != nil {
 		http.Error(response, "upstream connection failed", http.StatusBadGateway)

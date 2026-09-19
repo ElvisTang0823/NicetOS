@@ -5,6 +5,7 @@ package proxy
 import (
 	"bufio"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -43,8 +44,16 @@ func StartTransparentProxy(address string, checker URLChecker) (*TransparentProx
 		log.Printf("[PROXY] Checking: %s", target)
 		allowed, checkErr := checker.Check(target)
 		if checkErr != nil {
+			if errors.Is(checkErr, ErrUnknownDecision) {
+				log.Printf("[PROXY] Unknown decision for %s: %v (re-queueing retry)", target, checkErr)
+				if request.Method == http.MethodConnect {
+					handleBasicConnect(response, request, checker)
+					return
+				}
+				handleBasicHTTP(response, request)
+				return
+			}
 			log.Printf("[PROXY] Check error for %s: %v (allowing due to error)", target, checkErr)
-			// 錯誤時安全預設：允許通過，避免完全斷網
 			if request.Method == http.MethodConnect {
 				handleBasicConnect(response, request, checker)
 				return
@@ -181,7 +190,15 @@ func handleBasicHTTP(response http.ResponseWriter, request *http.Request) {
 func handleBasicConnect(response http.ResponseWriter, request *http.Request, checker URLChecker) {
 	target := "https://" + request.Host
 	allowed, err := checker.Check(target)
-	if err != nil || !allowed {
+	if err != nil {
+		if errors.Is(err, ErrUnknownDecision) {
+			log.Printf("[PROXY] Unknown decision for CONNECT %s; allowing through", target)
+			// fall through to connect upstream
+		} else {
+			serveBlockedPage(response, checker)
+			return
+		}
+	} else if !allowed {
 		serveBlockedPage(response, checker)
 		return
 	}

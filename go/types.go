@@ -1,9 +1,12 @@
 package proxy
 
 import (
+	"errors"
 	"net"
 	"net/http"
 )
+
+var ErrUnknownDecision = errors.New("unknown URL decision")
 
 type URLChecker interface {
 	Check(string) (bool, error)

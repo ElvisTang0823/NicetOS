@@ -8,7 +8,8 @@ LISTS = {
     "whitelist": "https://raw.githubusercontent.com/ElvisTang0823/NicetOS/main/data/whitelist.json",
 }
 
-SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
+SAVE_DIR = os.environ.get("NICETOS_DATA_DIR", os.path.join(ROOT_DIR, "data"))
 
 
 def download_list(name, url, save_dir):

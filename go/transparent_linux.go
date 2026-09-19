@@ -113,7 +113,14 @@ func handleHTTPConnection(connection net.Conn, reader *bufio.Reader, original st
 	}
 	target := "http://" + host + request.URL.RequestURI()
 	allowed, err := checker.Check(target)
-	if err != nil || !allowed {
+	if err != nil {
+		if errors.Is(err, ErrUnknownDecision) {
+			log.Printf("[PROXY] Unknown decision for %s; re-queueing retry", target)
+		} else {
+			writeBlockedPage(connection, checker)
+			return
+		}
+	} else if !allowed {
 		writeBlockedPage(connection, checker)
 		return
 	}
@@ -148,7 +155,16 @@ func handleTLSConnection(connection net.Conn, reader *bufio.Reader, original str
 		return
 	}
 	allowed, err := checker.Check("https://" + host)
-	if err != nil || !allowed {
+	if err != nil {
+		if errors.Is(err, ErrUnknownDecision) {
+			log.Printf("[PROXY] Unknown decision for %s; re-queueing retry", host)
+		} else {
+			if err := serveBlockedTLSPage(connection, reader, checker, host, ca); err != nil {
+				log.Printf("failed to render blocked TLS page for %s: %v", host, err)
+			}
+			return
+		}
+	} else if !allowed {
 		if err := serveBlockedTLSPage(connection, reader, checker, host, ca); err != nil {
 			log.Printf("failed to render blocked TLS page for %s: %v", host, err)
 		}

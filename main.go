@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -41,12 +42,15 @@ type domainLists struct {
 	whitelist map[string][]string
 }
 
+var ErrUnknownDecision = errors.New("unknown URL decision")
+
 type siteChecker struct {
 	root     string
 	urls     map[string]string
 	client   *http.Client
 	lists    atomic.Pointer[domainLists]
 	updateMu sync.Mutex
+	unknowns sync.Map
 }
 
 func (checker *siteChecker) BlockedPagePath() string {
@@ -61,6 +65,78 @@ func newSiteChecker(root string) *siteChecker {
 	}
 	checker.lists.Store(&domainLists{blacklist: map[string][]string{}, whitelist: map[string][]string{}})
 	return checker
+}
+
+func choosePythonInvocation(pythonCmd string, target string) (string, []string) {
+	if pythonCmd == "" {
+		pythonCmd = "python"
+	}
+	scriptCode := fmt.Sprintf("import sys; sys.path.insert(0, %q); import main; print(main.check_url(sys.argv[1]))", ".")
+	if strings.EqualFold(pythonCmd, "py") {
+		return pythonCmd, []string{"-3", "-c", scriptCode, target}
+	}
+	return pythonCmd, []string{"-c", scriptCode, target}
+}
+
+func choosePythonScriptInvocation(pythonCmd string, scriptPath string, target string) (string, []string) {
+	if pythonCmd == "" {
+		pythonCmd = "python"
+	}
+	if strings.EqualFold(pythonCmd, "py") {
+		return pythonCmd, []string{"-3", scriptPath, target}
+	}
+	return pythonCmd, []string{scriptPath, target}
+}
+
+func pythonCheckURL(root string, target string) (bool, error) {
+	scriptPath := filepath.Join(root, "main.py")
+	if _, err := os.Stat(scriptPath); err != nil {
+		return false, nil
+	}
+
+	candidates := []string{"py", "python", "python3"}
+	for _, candidate := range candidates {
+		if _, err := exec.LookPath(candidate); err == nil {
+			command, args := choosePythonScriptInvocation(candidate, scriptPath, target)
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			execCmd := exec.CommandContext(ctx, command, args...)
+			execCmd.Env = append(os.Environ(), "PYTHONPATH="+root)
+			output, err := execCmd.Output()
+			if err != nil {
+				if ctx.Err() == context.DeadlineExceeded {
+					return false, proxy.ErrUnknownDecision
+				}
+				return true, err
+			}
+			result := strings.TrimSpace(string(output))
+			switch result {
+			case "True":
+				return true, nil
+			case "False":
+				return false, nil
+			case "0":
+				return false, proxy.ErrUnknownDecision
+			default:
+				return false, proxy.ErrUnknownDecision
+			}
+		}
+	}
+	return false, nil
+}
+
+func (checker *siteChecker) allowUnknownRetry(domain string) bool {
+	if domain == "" {
+		return true
+	}
+	count, _ := checker.unknowns.LoadOrStore(domain, 0)
+	current := count.(int)
+	if current < 1 {
+		checker.unknowns.Store(domain, current+1)
+		return true
+	}
+	checker.unknowns.Store(domain, current+1)
+	return true
 }
 
 func (checker *siteChecker) Check(target string) (bool, error) {
@@ -78,7 +154,20 @@ func (checker *siteChecker) Check(target string) (bool, error) {
 			return false, nil
 		}
 	}
-	return true, nil
+	for _, allowed := range lists.whitelist[key] {
+		if allowed == domain {
+			return true, nil
+		}
+	}
+	allowed, err := pythonCheckURL(checker.root, target)
+	if err != nil {
+		if errors.Is(err, proxy.ErrUnknownDecision) {
+			log.Printf("[CHECK] unknown decision for %s; allowing after bounded retry", domain)
+			return checker.allowUnknownRetry(domain), nil
+		}
+		return true, nil
+	}
+	return allowed, nil
 }
 
 func extractDomain(target string) string {
@@ -158,35 +247,46 @@ func (checker *siteChecker) startListRefresh(stop <-chan struct{}) {
 func (checker *siteChecker) refreshLists(ctx context.Context) {
 	checker.updateMu.Lock()
 	defer checker.updateMu.Unlock()
-	type fetchedList struct {
-		name    string
-		entries map[string][]string
-		err     error
+
+	if err := checker.runPythonListUpdater(); err != nil {
+		log.Printf("[LISTS] Python updater failed: %v; keeping current lists", err)
+		return
 	}
-	results := make(chan fetchedList, len(checker.urls))
-	for name, sourceURL := range checker.urls {
-		go func(name, sourceURL string) {
-			entries, err := checker.fetchHashMap(ctx, sourceURL)
-			results <- fetchedList{name: name, entries: entries, err: err}
-		}(name, sourceURL)
+	if err := checker.loadListsFromDisk(); err != nil {
+		log.Printf("[LISTS] failed to reload lists from disk: %v", err)
+		return
 	}
-	fetched := make(map[string]map[string][]string, len(checker.urls))
-	for range checker.urls {
-		result := <-results
-		if result.err != nil {
-			log.Printf("[LISTS] %s update failed: %v; keeping current lists", result.name, result.err)
-			return
+	log.Printf("[LISTS] blacklist and whitelist updated via python/get.py")
+}
+
+func (checker *siteChecker) runPythonListUpdater() error {
+	scriptPath := filepath.Join(checker.root, "python", "get.py")
+	if _, err := os.Stat(scriptPath); err != nil {
+		return fmt.Errorf("python getter script not found: %w", err)
+	}
+
+	candidates := []string{"py", "python", "python3"}
+	for _, candidate := range candidates {
+		if _, err := exec.LookPath(candidate); err == nil {
+			command := candidate
+			args := []string{scriptPath}
+			if strings.EqualFold(candidate, "py") {
+				args = []string{"-3", scriptPath}
+			}
+			execCmd := exec.CommandContext(context.Background(), command, args...)
+			execCmd.Env = append(os.Environ(), "NICETOS_DATA_DIR="+filepath.Join(checker.root, "data"))
+			execCmd.Dir = checker.root
+			output, err := execCmd.CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("python script failed: %v: %s", err, strings.TrimSpace(string(output)))
+			}
+			if output != nil && len(strings.TrimSpace(string(output))) > 0 {
+				log.Printf("[LISTS] python/get.py output: %s", strings.TrimSpace(string(output)))
+			}
+			return nil
 		}
-		fetched[result.name] = result.entries
 	}
-	for name, entries := range fetched {
-		if err := writeHashMap(filepath.Join(checker.root, "data", name+".json"), entries); err != nil {
-			log.Printf("[LISTS] %s download succeeded but could not save it: %v", name, err)
-			return
-		}
-	}
-	checker.lists.Store(&domainLists{blacklist: fetched["blacklist"], whitelist: fetched["whitelist"]})
-	log.Printf("[LISTS] blacklist and whitelist updated")
+	return errors.New("python interpreter not found")
 }
 
 func (checker *siteChecker) fetchHashMap(ctx context.Context, sourceURL string) (map[string][]string, error) {

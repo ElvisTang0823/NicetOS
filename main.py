@@ -21,7 +21,7 @@ except ImportError:  # pragma: no cover - optional dependency for AI fallback
     BeautifulSoup = None
 
 HASH_CAPACITY = 142867
-OLLAMA_API = "http://localhost:11434/api/chat"
+OLLAMA_API = os.environ.get("NICETOS_OLLAMA_API", "").rstrip("/") + "/api/chat"
 MODEL_NAME = "gemma4-child-safety"
 CACHE_TTL_SECONDS = 300
 URL_CACHE = {}
@@ -161,7 +161,7 @@ def fetch_webpage_info(url: str):
 
 def check_url_safety(url: str):
     """自動爬取網頁並呼叫 Ollama 判斷兒少安全性"""
-    if requests is None:
+    if requests is None or not OLLAMA_API.startswith("http://127.0.0.1:"):
         return None
 
     title, content = fetch_webpage_info(url)
@@ -272,4 +272,3 @@ if __name__ == '__main__':
     else:
         target = input("請輸入網址: ")
     print(check_url(str(target)))
-

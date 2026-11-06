@@ -2,5 +2,6 @@ ubuntu-24.04.4-desktop-amd64.iso
 
 **/__pycache__/
 release/
+/release-assets/
 ollama\models\gemma4_child_safety_q4.gguf
 /ollama/

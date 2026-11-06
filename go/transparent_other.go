@@ -11,7 +11,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
 )
 
 func StartTransparentProxy(address string, checker URLChecker) (*TransparentProxy, error) {
@@ -42,7 +41,7 @@ func StartTransparentProxy(address string, checker URLChecker) (*TransparentProx
 			target = "https://" + request.Host
 		}
 		log.Printf("[PROXY] Checking: %s", target)
-		allowed, checkErr := checker.Check(target)
+		allowed, reason, checkErr := checkWithReason(checker, target)
 		if checkErr != nil {
 			if errors.Is(checkErr, ErrUnknownDecision) {
 				log.Printf("[PROXY] Unknown decision for %s: %v (re-queueing retry)", target, checkErr)
@@ -64,10 +63,10 @@ func StartTransparentProxy(address string, checker URLChecker) (*TransparentProx
 		if !allowed {
 			log.Printf("[PROXY] BLOCKED: %s (blacklist)", target)
 			if request.Method == http.MethodConnect {
-				handleBlockedConnect(response, request, checker, ca)
+				handleBlockedConnect(response, request, checker, ca, reason)
 				return
 			}
-			serveBlockedPage(response, checker)
+			serveBlockedPage(response, checker, reason)
 			return
 		}
 		log.Printf("[PROXY] ALLOWED: %s", target)
@@ -116,7 +115,7 @@ func (proxy *TransparentProxy) Close() error {
 
 // handleBlockedConnect completes CONNECT first, then serves the block page over
 // TLS. Chromium otherwise replaces an HTTP CONNECT denial with its own error.
-func handleBlockedConnect(response http.ResponseWriter, request *http.Request, checker URLChecker, ca *certificateAuthority) {
+func handleBlockedConnect(response http.ResponseWriter, request *http.Request, checker URLChecker, ca *certificateAuthority, reason string) {
 	hijacker, ok := response.(http.Hijacker)
 	if !ok {
 		http.Error(response, "CONNECT is not supported", http.StatusInternalServerError)
@@ -144,11 +143,11 @@ func handleBlockedConnect(response http.ResponseWriter, request *http.Request, c
 	if _, err := http.ReadRequest(bufio.NewReader(tlsConnection)); err != nil {
 		return
 	}
-	writeBlockedHTTPResponse(tlsConnection, checker)
+	writeBlockedHTTPResponse(tlsConnection, checker, reason)
 }
 
-func writeBlockedHTTPResponse(writer io.Writer, checker URLChecker) {
-	body, err := readBlockedPageBody(checker)
+func writeBlockedHTTPResponse(writer io.Writer, checker URLChecker, reason string) {
+	body, err := readBlockedPageBody(checker, reason)
 	if err != nil {
 		_, _ = io.WriteString(writer, "HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 24\r\n\r\naccess denied by NicetOS")
 		return
@@ -156,18 +155,27 @@ func writeBlockedHTTPResponse(writer io.Writer, checker URLChecker) {
 	_, _ = fmt.Fprintf(writer, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
 }
 
-func serveBlockedPage(response http.ResponseWriter, checker URLChecker) {
+func serveBlockedPage(response http.ResponseWriter, checker URLChecker, reason string) {
 	pagePath := checker.BlockedPagePath()
-	body, err := os.ReadFile(pagePath)
+	body, err := readBlockedPageBody(checker, reason)
 	if err != nil {
 		log.Printf("[PROXY] Failed to read blocked page %s: %v", pagePath, err)
 		http.Error(response, "access denied by NicetOS", http.StatusForbidden)
 		return
 	}
-
 	response.Header().Set("Content-Type", "text/html; charset=utf-8")
 	response.WriteHeader(http.StatusForbidden)
 	_, _ = response.Write(body)
+}
+
+func checkWithReason(checker URLChecker, target string) (bool, string, error) {
+	if detailed, ok := checker.(interface {
+		CheckWithReason(string) (bool, string, error)
+	}); ok {
+		return detailed.CheckWithReason(target)
+	}
+	allowed, err := checker.Check(target)
+	return allowed, "", err
 }
 
 func handleBasicHTTP(response http.ResponseWriter, request *http.Request) {
@@ -189,17 +197,17 @@ func handleBasicHTTP(response http.ResponseWriter, request *http.Request) {
 
 func handleBasicConnect(response http.ResponseWriter, request *http.Request, checker URLChecker) {
 	target := "https://" + request.Host
-	allowed, err := checker.Check(target)
+	allowed, reason, err := checkWithReason(checker, target)
 	if err != nil {
 		if errors.Is(err, ErrUnknownDecision) {
 			log.Printf("[PROXY] Unknown decision for CONNECT %s; allowing through", target)
 			// fall through to connect upstream
 		} else {
-			serveBlockedPage(response, checker)
+			serveBlockedPage(response, checker, reason)
 			return
 		}
 	} else if !allowed {
-		serveBlockedPage(response, checker)
+		serveBlockedPage(response, checker, reason)
 		return
 	}
 	upstream, err := net.Dial("tcp", request.Host)

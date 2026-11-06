@@ -85,6 +85,29 @@ func TestUnknownDomainIsBlockedWhenAIHasNoDecision(t *testing.T) {
 	}
 }
 
+func TestGemmaBlockReasonIsPassedToBlockedPage(t *testing.T) {
+	root := t.TempDir()
+	scriptPath := filepath.Join(root, "main.py")
+	script := `def check_url_with_details(url): return {"decision":"BLOCK","category":"Gambling","confidence":0.93,"reason":"The page promotes betting.","source":"Gemma4"}`
+	if err := os.WriteFile(scriptPath, []byte(script+"\n"), 0644); err != nil {
+		t.Fatalf("write test script: %v", err)
+	}
+
+	checker := newSiteChecker(root)
+	allowed, reason, err := checker.CheckWithReason("https://example.com")
+	if err != nil {
+		t.Fatalf("check URL: %v", err)
+	}
+	if allowed {
+		t.Fatal("expected Gemma BLOCK decision to block the URL")
+	}
+	for _, expected := range []string{"Gambling", "93%", "The page promotes betting."} {
+		if !strings.Contains(reason, expected) {
+			t.Errorf("expected block reason to contain %q, got %q", expected, reason)
+		}
+	}
+}
+
 func TestUnknownDomainIsBlockedWhenPythonFails(t *testing.T) {
 	root := t.TempDir()
 	scriptPath := filepath.Join(root, "main.py")

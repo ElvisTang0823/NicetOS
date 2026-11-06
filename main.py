@@ -112,10 +112,19 @@ def get_cached_decision(url: str):
     return cached['decision']
 
 
-def set_cached_decision(url: str, decision):
+def get_cached_details(url: str):
+    key = build_cache_key(url)
+    cached = URL_CACHE.get(key)
+    if not cached or time.monotonic() >= cached['expires_at']:
+        return None
+    return cached.get('details')
+
+
+def set_cached_decision(url: str, decision, details=None):
     key = build_cache_key(url)
     URL_CACHE[key] = {
         'decision': decision,
+        'details': details,
         'expires_at': time.monotonic() + CACHE_TTL_SECONDS,
     }
 
@@ -212,54 +221,91 @@ def check_url_safety(url: str):
         return None
 
 
-def check_url(input_link):
+def check_url_with_details(input_link):
+    def result(decision, category, confidence, reason, source):
+        return {
+            "decision": decision,
+            "category": category,
+            "confidence": confidence,
+            "reason": reason,
+            "source": source,
+        }
+
     if not input_link:
-        return 0
+        return result("UNKNOWN", "無法判斷", 0.0, "沒有提供有效網址。", "NicetOS")
 
     cached = get_cached_decision(input_link)
     if cached is not None:
-        return cached
+        details = get_cached_details(input_link)
+        if details:
+            return details
+        if cached is False:
+            return result("BLOCK", "已封鎖", 1.0, "此網址已符合封鎖規則。", "NicetOS")
+        if cached is True:
+            return result("ALLOW", "白名單", 1.0, "此網址符合允許規則。", "NicetOS")
+        return result("UNKNOWN", "無法判斷", 0.0, "目前無法取得明確判斷。", "NicetOS")
 
     domain = extract_domain(input_link)
     if not domain:
         queue_retry(input_link)
-        set_cached_decision(input_link, 0)
-        return 0
+        details = result("UNKNOWN", "無效網址", 0.0, "無法解析網址網域，因此依安全規則封鎖。", "NicetOS")
+        set_cached_decision(input_link, 0, details)
+        return details
 
     hash_key = get_hash_key(domain)
     if not hash_key:
         queue_retry(input_link)
-        set_cached_decision(input_link, 0)
-        return 0
+        details = result("UNKNOWN", "無法判斷", 0.0, "無法計算網址規則索引，因此依安全規則封鎖。", "NicetOS")
+        set_cached_decision(input_link, 0, details)
+        return details
 
     if hash_key in blacklist and domain_in_bucket(blacklist[hash_key], domain):
-        set_cached_decision(input_link, False)
-        return False
+        details = result("BLOCK", "黑名單", 1.0, f"{domain} 命中本機黑名單。", "NicetOS 黑名單")
+        set_cached_decision(input_link, False, details)
+        return details
 
     if hash_key in whitelist and domain_in_bucket(whitelist[hash_key], domain):
-        set_cached_decision(input_link, True)
-        return True
+        details = result("ALLOW", "白名單", 1.0, f"{domain} 命中本機白名單。", "NicetOS 白名單")
+        set_cached_decision(input_link, True, details)
+        return details
 
     try:
-        decision = check_url_safety(input_link)
-        if decision is None:
-            queue_retry(input_link)
-            set_cached_decision(input_link, 0)
-            return 0
-        parsed = str(decision.get("decision", "")).upper()
+        model_result = check_url_safety(input_link)
+        if model_result is None:
+            raise ValueError("AI analysis did not return a result")
+        parsed = str(model_result.get("decision", "")).upper()
+        category = str(model_result.get("category", "未分類"))[:80]
+        reason = str(model_result.get("reason", "模型未提供判斷原因。"))[:500]
+        try:
+            confidence = max(0.0, min(1.0, float(model_result.get("confidence", 0.0))))
+        except (TypeError, ValueError):
+            confidence = 0.0
         if parsed == "BLOCK":
-            set_cached_decision(input_link, False)
-            return False
+            details = result("BLOCK", category, confidence, reason, "Gemma4 模型")
+            set_cached_decision(input_link, False, details)
+            return details
         if parsed == "ALLOW":
-            set_cached_decision(input_link, True)
-            return True
+            details = result("ALLOW", category, confidence, reason, "Gemma4 模型")
+            set_cached_decision(input_link, True, details)
+            return details
     except Exception:
         queue_retry(input_link)
-        set_cached_decision(input_link, 0)
-        return 0
+        details = result("UNKNOWN", "無法判斷", 0.0, "AI 無法完成分析，依安全規則封鎖非白名單網址。", "NicetOS")
+        set_cached_decision(input_link, 0, details)
+        return details
 
     queue_retry(input_link)
-    set_cached_decision(input_link, 0)
+    details = result("UNKNOWN", "無法判斷", 0.0, "AI 回覆格式或判斷結果無效，依安全規則封鎖。", "NicetOS")
+    set_cached_decision(input_link, 0, details)
+    return details
+
+
+def check_url(input_link):
+    decision = check_url_with_details(input_link)["decision"]
+    if decision == "BLOCK":
+        return False
+    if decision == "ALLOW":
+        return True
     return 0
 
 

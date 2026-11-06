@@ -65,6 +65,28 @@
     color: #f8e2e2;
   }
 
+  .reason {
+    margin: 0 0 28px;
+    padding: 18px 20px;
+    border: 1px solid rgba(255, 255, 255, 0.35);
+    border-radius: 12px;
+    background: rgba(0, 0, 0, 0.16);
+  }
+
+  .reason h2 {
+    margin: 0 0 10px;
+    font-size: 18px;
+  }
+
+  .reason p {
+    margin: 0;
+    color: #fff4f4;
+    font-size: 16px;
+    line-height: 1.7;
+    white-space: pre-line;
+    overflow-wrap: anywhere;
+  }
+
   .actions {
     display: flex;
     justify-content: flex-end;
@@ -104,6 +126,11 @@
       此網站的內容不符合兒少上網安全規範，系統已依家長監護設定將其封鎖。
       如需調整權限，請洽詢家長或監護人。
     </p>
+
+    <section class="reason" aria-labelledby="reason-title">
+      <h2 id="reason-title">封鎖原因</h2>
+      <p>{{BLOCK_REASON}}</p>
+    </section>
   </div>
 
 </body>

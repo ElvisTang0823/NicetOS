@@ -15,14 +15,16 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
-	ollamaBundleTag      = "nicetos-ollama-v0.40.13"
-	ollamaBundleVersion  = "ollama-v0.40.13"
-	ollamaBundleManifest = "ollama-bundle-manifest.json"
-	maxBundleBytes       = int64(16 << 30)
+	ollamaBundleTag              = "nicetos-ollama-v0.40.13"
+	ollamaBundleVersion          = "ollama-v0.40.13"
+	ollamaBundleManifest         = "ollama-bundle-manifest.json"
+	maxBundleBytes               = int64(16 << 30)
+	maxConcurrentBundleDownloads = 4
 )
 
 var installerBuild = "false"
@@ -275,59 +277,123 @@ func validateBundleMetadata(metadata ollamaBundleMetadata) error {
 	return nil
 }
 
+type bundleDownloadProgress struct {
+	mu             sync.Mutex
+	totalBytes     int64
+	downloaded     int64
+	lastReportedAt time.Time
+}
+
+func (progress *bundleDownloadProgress) Write(data []byte) (int, error) {
+	progress.mu.Lock()
+	defer progress.mu.Unlock()
+	progress.downloaded += int64(len(data))
+	if time.Since(progress.lastReportedAt) >= 2*time.Second {
+		progress.reportLocked()
+	}
+	return len(data), nil
+}
+
+func (progress *bundleDownloadProgress) report() {
+	progress.mu.Lock()
+	defer progress.mu.Unlock()
+	progress.reportLocked()
+}
+
+func (progress *bundleDownloadProgress) reportLocked() {
+	percentage := float64(progress.downloaded) * 100 / float64(progress.totalBytes)
+	if percentage > 100 {
+		percentage = 100
+	}
+	log.Printf("[INSTALL] Download progress: %.1f%% (%s / %s)",
+		percentage, formatBundleBytes(progress.downloaded),
+		formatBundleBytes(progress.totalBytes),
+	)
+	progress.lastReportedAt = time.Now()
+}
+
+func formatBundleBytes(size int64) string {
+	const unit = 1024
+	if size < unit {
+		return fmt.Sprintf("%d B", size)
+	}
+	value := float64(size)
+	units := []string{"KiB", "MiB", "GiB", "TiB"}
+	for _, unitName := range units {
+		value /= unit
+		if value < unit || unitName == units[len(units)-1] {
+			return fmt.Sprintf("%.1f %s", value, unitName)
+		}
+	}
+	return fmt.Sprintf("%d B", size)
+}
+
 func downloadBundleArchive(manifestURL string, metadata ollamaBundleMetadata, archivePath string) error {
 	baseURL := strings.TrimSuffix(manifestURL, ollamaBundleManifest)
+	client := &http.Client{Timeout: time.Hour}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	progress := &bundleDownloadProgress{totalBytes: metadata.ArchiveSize}
+	progress.report()
+	var downloads sync.WaitGroup
+	semaphore := make(chan struct{}, maxConcurrentBundleDownloads)
+	var firstDownloadError error
+	var errorOnce sync.Once
+	for index, part := range metadata.Parts {
+		semaphore <- struct{}{}
+		downloads.Add(1)
+		go func(index int, part ollamaBundlePart) {
+			defer downloads.Done()
+			defer func() { <-semaphore }()
+			partPath := filepath.Join(filepath.Dir(archivePath), part.Name)
+			if err := downloadBundlePart(ctx, client, baseURL+part.Name, part, partPath, progress); err != nil {
+				errorOnce.Do(func() {
+					firstDownloadError = fmt.Errorf("download release part %d/%d (%s): %w", index+1, len(metadata.Parts), part.Name, err)
+				})
+				cancel()
+				return
+			}
+			progress.report()
+		}(index, part)
+	}
+	downloads.Wait()
+	if firstDownloadError != nil {
+		return firstDownloadError
+	}
+
 	archive, err := os.Create(archivePath)
 	if err != nil {
 		return err
 	}
 	archiveHash := sha256.New()
-	client := &http.Client{Timeout: time.Hour}
 	var total int64
 	for index, part := range metadata.Parts {
-		url := baseURL + part.Name
-		ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
-		request, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if requestErr != nil {
-			cancel()
+		partPath := filepath.Join(filepath.Dir(archivePath), part.Name)
+		input, err := os.Open(partPath)
+		if err != nil {
 			_ = archive.Close()
-			return requestErr
+			return fmt.Errorf("open downloaded release part %s: %w", part.Name, err)
 		}
-		response, requestErr := client.Do(request)
-		if requestErr != nil {
-			cancel()
-			_ = archive.Close()
-			return fmt.Errorf("download release asset %s: %w", part.Name, requestErr)
-		}
-		if response.StatusCode != http.StatusOK {
-			status := response.Status
-			_ = response.Body.Close()
-			cancel()
-			_ = archive.Close()
-			return fmt.Errorf("download release asset %s: HTTP %s", part.Name, status)
-		}
-		partHash := sha256.New()
-		written, copyErr := io.Copy(io.MultiWriter(archive, archiveHash, partHash), io.LimitReader(response.Body, part.Size+1))
-		bodyCloseErr := response.Body.Close()
-		cancel()
+		written, copyErr := io.Copy(io.MultiWriter(archive, archiveHash), input)
+		inputCloseErr := input.Close()
 		if copyErr != nil {
 			_ = archive.Close()
-			return fmt.Errorf("write release asset %s: %w", part.Name, copyErr)
+			return fmt.Errorf("assemble release part %s: %w", part.Name, copyErr)
 		}
-		if bodyCloseErr != nil {
+		if inputCloseErr != nil {
 			_ = archive.Close()
-			return bodyCloseErr
+			return fmt.Errorf("close downloaded release part %s: %w", part.Name, inputCloseErr)
 		}
 		if written != part.Size {
 			_ = archive.Close()
-			return fmt.Errorf("release asset %s has size %d, expected %d", part.Name, written, part.Size)
-		}
-		if !strings.EqualFold(hex.EncodeToString(partHash.Sum(nil)), part.SHA256) {
-			_ = archive.Close()
-			return fmt.Errorf("release asset %s failed SHA-256 verification", part.Name)
+			return fmt.Errorf("release part %s has size %d during assembly, expected %d", part.Name, written, part.Size)
 		}
 		total += written
-		log.Printf("[INSTALL] Downloaded part %d/%d (%d bytes)", index+1, len(metadata.Parts), written)
+		if err := os.Remove(partPath); err != nil {
+			_ = archive.Close()
+			return fmt.Errorf("remove assembled release part %s: %w", part.Name, err)
+		}
+		log.Printf("[INSTALL] Verified and assembled release part %d/%d", index+1, len(metadata.Parts))
 	}
 	closeErr := archive.Close()
 	if closeErr != nil {
@@ -336,6 +402,53 @@ func downloadBundleArchive(manifestURL string, metadata ollamaBundleMetadata, ar
 	if total != metadata.ArchiveSize || !strings.EqualFold(hex.EncodeToString(archiveHash.Sum(nil)), metadata.ArchiveSHA) {
 		return errors.New("downloaded Ollama archive failed size or SHA-256 verification")
 	}
+	return nil
+}
+
+func downloadBundlePart(parent context.Context, client *http.Client, url string, part ollamaBundlePart, path string, progress io.Writer) error {
+	ctx, cancel := context.WithTimeout(parent, time.Hour)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusOK {
+		status := response.Status
+		if err := response.Body.Close(); err != nil {
+			return errors.Join(fmt.Errorf("HTTP %s", status), err)
+		}
+		return fmt.Errorf("HTTP %s", status)
+	}
+	output, err := os.Create(path)
+	if err != nil {
+		_ = response.Body.Close()
+		return err
+	}
+	partHash := sha256.New()
+	written, copyErr := io.Copy(io.MultiWriter(output, partHash, progress), io.LimitReader(response.Body, part.Size+1))
+	bodyCloseErr := response.Body.Close()
+	outputCloseErr := output.Close()
+	if copyErr != nil {
+		_ = os.Remove(path)
+		return errors.Join(copyErr, bodyCloseErr, outputCloseErr)
+	}
+	if bodyCloseErr != nil || outputCloseErr != nil {
+		_ = os.Remove(path)
+		return errors.Join(bodyCloseErr, outputCloseErr)
+	}
+	if written != part.Size {
+		_ = os.Remove(path)
+		return fmt.Errorf("size is %d bytes, expected %d", written, part.Size)
+	}
+	if !strings.EqualFold(hex.EncodeToString(partHash.Sum(nil)), part.SHA256) {
+		_ = os.Remove(path)
+		return errors.New("SHA-256 verification failed")
+	}
+	log.Printf("[INSTALL] Downloaded and verified %s (%s)", part.Name, formatBundleBytes(written))
 	return nil
 }
 

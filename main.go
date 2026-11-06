@@ -42,15 +42,23 @@ type domainLists struct {
 	whitelist map[string][]string
 }
 
+type decisionDetails struct {
+	Decision   string  `json:"decision"`
+	Category   string  `json:"category"`
+	Confidence float64 `json:"confidence"`
+	Reason     string  `json:"reason"`
+	Source     string  `json:"source"`
+}
+
 var ErrUnknownDecision = errors.New("unknown URL decision")
 
 type siteChecker struct {
-	root     string
-	urls     map[string]string
-	client   *http.Client
-	lists    atomic.Pointer[domainLists]
-	updateMu sync.Mutex
-	unknowns sync.Map
+	root      string
+	urls      map[string]string
+	ollamaAPI string
+	client    *http.Client
+	lists     atomic.Pointer[domainLists]
+	updateMu  sync.Mutex
 }
 
 func (checker *siteChecker) BlockedPagePath() string {
@@ -88,86 +96,183 @@ func choosePythonScriptInvocation(pythonCmd string, scriptPath string, target st
 	return pythonCmd, []string{scriptPath, target}
 }
 
-func pythonCheckURL(root string, target string) (bool, error) {
+func replaceEnvironment(environment []string, names ...string) []string {
+	result := make([]string, 0, len(environment))
+	for _, entry := range environment {
+		name, _, found := strings.Cut(entry, "=")
+		if !found {
+			result = append(result, entry)
+			continue
+		}
+		replaced := false
+		for _, target := range names {
+			if strings.EqualFold(name, target) {
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			result = append(result, entry)
+		}
+	}
+	return result
+}
+
+func pythonExecutable(root string) (string, []string) {
+	bundled := filepath.Join(root, "python_runtime", "python.exe")
+	if info, err := os.Stat(bundled); err == nil && !info.IsDir() {
+		return bundled, nil
+	}
+	for _, candidate := range []string{"py", "python", "python3"} {
+		if command, err := exec.LookPath(candidate); err == nil {
+			if strings.EqualFold(candidate, "py") {
+				return command, []string{"-3"}
+			}
+			return command, nil
+		}
+	}
+	return "", nil
+}
+
+func pythonCheckURL(root string, target string, ollamaAPI string) (bool, error) {
 	scriptPath := filepath.Join(root, "main.py")
 	if _, err := os.Stat(scriptPath); err != nil {
 		return false, nil
 	}
 
-	candidates := []string{"py", "python", "python3"}
-	for _, candidate := range candidates {
-		if _, err := exec.LookPath(candidate); err == nil {
-			command, args := choosePythonScriptInvocation(candidate, scriptPath, target)
-			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-			defer cancel()
-			execCmd := exec.CommandContext(ctx, command, args...)
-			execCmd.Env = append(os.Environ(), "PYTHONPATH="+root)
-			output, err := execCmd.Output()
-			if err != nil {
-				if ctx.Err() == context.DeadlineExceeded {
-					return false, proxy.ErrUnknownDecision
-				}
-				return true, err
-			}
-			result := strings.TrimSpace(string(output))
-			switch result {
-			case "True":
-				return true, nil
-			case "False":
-				return false, nil
-			case "0":
-				return false, proxy.ErrUnknownDecision
-			default:
-				return false, proxy.ErrUnknownDecision
-			}
-		}
+	python, prefixArgs := pythonExecutable(root)
+	if python == "" {
+		return false, errors.New("python interpreter not found")
 	}
-	return false, nil
+	args := append(prefixArgs, scriptPath, target)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	execCmd := exec.CommandContext(ctx, python, args...)
+	execCmd.Env = append(replaceEnvironment(os.Environ(), "PYTHONPATH", "NICETOS_OLLAMA_API"),
+		"PYTHONPATH="+root, "NICETOS_OLLAMA_API="+ollamaAPI)
+	output, err := execCmd.Output()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return false, proxy.ErrUnknownDecision
+		}
+		return true, err
+	}
+	result := strings.TrimSpace(string(output))
+	switch result {
+	case "True":
+		return true, nil
+	case "False":
+		return false, nil
+	case "0":
+		return false, proxy.ErrUnknownDecision
+	default:
+		return false, proxy.ErrUnknownDecision
+	}
 }
 
-func (checker *siteChecker) allowUnknownRetry(domain string) bool {
-	if domain == "" {
-		return true
+func pythonCheckURLWithDetails(root string, target string, ollamaAPI string) (decisionDetails, error) {
+	scriptPath := filepath.Join(root, "main.py")
+	if _, err := os.Stat(scriptPath); err != nil {
+		return decisionDetails{}, err
 	}
-	count, _ := checker.unknowns.LoadOrStore(domain, 0)
-	current := count.(int)
-	if current < 1 {
-		checker.unknowns.Store(domain, current+1)
-		return true
+	python, prefixArgs := pythonExecutable(root)
+	if python == "" {
+		return decisionDetails{}, errors.New("python interpreter not found")
 	}
-	checker.unknowns.Store(domain, current+1)
-	return true
+	script := "import json,sys; sys.path.insert(0,sys.argv[1]); import main; print(json.dumps(main.check_url_with_details(sys.argv[2]), ensure_ascii=False))"
+	args := append(prefixArgs, "-c", script, root, target)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, python, args...)
+	command.Env = append(replaceEnvironment(os.Environ(), "PYTHONPATH", "NICETOS_OLLAMA_API"),
+		"PYTHONPATH="+root, "NICETOS_OLLAMA_API="+ollamaAPI)
+	output, err := command.Output()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return decisionDetails{}, proxy.ErrUnknownDecision
+		}
+		return decisionDetails{}, err
+	}
+	var details decisionDetails
+	if err := json.Unmarshal(output, &details); err != nil {
+		return decisionDetails{}, fmt.Errorf("decode Python decision: %w", err)
+	}
+	if details.Decision != "ALLOW" && details.Decision != "BLOCK" {
+		return details, proxy.ErrUnknownDecision
+	}
+	return details, nil
+}
+
+func pythonScriptArgs(prefixArgs []string, scriptPath string) []string {
+	args := append([]string(nil), prefixArgs...)
+	return append(args, scriptPath)
+}
+
+func runPythonListUpdater(root string) error {
+	scriptPath := filepath.Join(root, "python", "get.py")
+	if _, err := os.Stat(scriptPath); err != nil {
+		return fmt.Errorf("python getter script not found: %w", err)
+	}
+	python, prefixArgs := pythonExecutable(root)
+	if python == "" {
+		return errors.New("python interpreter not found")
+	}
+	execCmd := exec.CommandContext(context.Background(), python, pythonScriptArgs(prefixArgs, scriptPath)...)
+	execCmd.Env = append(replaceEnvironment(os.Environ(), "NICETOS_DATA_DIR"),
+		"NICETOS_DATA_DIR="+filepath.Join(root, "data"))
+	execCmd.Dir = root
+	output, err := execCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("python script failed: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+	if output != nil && len(strings.TrimSpace(string(output))) > 0 {
+		log.Printf("[LISTS] python/get.py output: %s", strings.TrimSpace(string(output)))
+	}
+	return nil
 }
 
 func (checker *siteChecker) Check(target string) (bool, error) {
+	allowed, _, err := checker.CheckWithReason(target)
+	return allowed, err
+}
+
+func (checker *siteChecker) CheckWithReason(target string) (bool, string, error) {
 	domain := extractDomain(target)
 	if domain == "" {
-		return true, nil
+		log.Printf("[CHECK] could not determine the requested domain; blocking")
+		return false, "NicetOS 無法解析此網址，依安全規則封鎖。", nil
 	}
 	lists := checker.lists.Load()
 	if lists == nil {
-		return true, errors.New("domain lists are not loaded")
+		log.Printf("[CHECK] domain lists are unavailable for %s; blocking", domain)
+		return false, "安全名單尚未載入，依安全規則封鎖。", nil
 	}
 	key := domainHashKey(domain)
 	for _, blocked := range lists.blacklist[key] {
 		if blocked == domain {
-			return false, nil
+			return false, fmt.Sprintf("分類：黑名單\n判斷依據：%s 命中 NicetOS 黑名單。", domain), nil
 		}
 	}
 	for _, allowed := range lists.whitelist[key] {
 		if allowed == domain {
-			return true, nil
+			return true, "", nil
 		}
 	}
-	allowed, err := pythonCheckURL(checker.root, target)
+	details, err := pythonCheckURLWithDetails(checker.root, target, checker.ollamaAPI)
 	if err != nil {
 		if errors.Is(err, proxy.ErrUnknownDecision) {
-			log.Printf("[CHECK] unknown decision for %s; allowing after bounded retry", domain)
-			return checker.allowUnknownRetry(domain), nil
+			log.Printf("[CHECK] unknown decision for %s; blocking because no safe decision is available", domain)
+			return false, "Gemma4 無法提供明確判斷，依安全規則封鎖非白名單網址。", nil
 		}
-		return true, nil
+		log.Printf("[CHECK] decision failed for %s; blocking: %v", domain, err)
+		return false, fmt.Sprintf("Gemma4 判斷失敗（%v），依安全規則封鎖非白名單網址。", err), nil
 	}
-	return allowed, nil
+	reason := fmt.Sprintf("判斷來源：%s\n分類：%s\n信心度：%.0f%%\n判斷原因：%s",
+		details.Source, details.Category, details.Confidence*100, details.Reason)
+	if details.Decision == "BLOCK" {
+		return false, reason, nil
+	}
+	return true, reason, nil
 }
 
 func extractDomain(target string) string {
@@ -260,33 +365,7 @@ func (checker *siteChecker) refreshLists(ctx context.Context) {
 }
 
 func (checker *siteChecker) runPythonListUpdater() error {
-	scriptPath := filepath.Join(checker.root, "python", "get.py")
-	if _, err := os.Stat(scriptPath); err != nil {
-		return fmt.Errorf("python getter script not found: %w", err)
-	}
-
-	candidates := []string{"py", "python", "python3"}
-	for _, candidate := range candidates {
-		if _, err := exec.LookPath(candidate); err == nil {
-			command := candidate
-			args := []string{scriptPath}
-			if strings.EqualFold(candidate, "py") {
-				args = []string{"-3", scriptPath}
-			}
-			execCmd := exec.CommandContext(context.Background(), command, args...)
-			execCmd.Env = append(os.Environ(), "NICETOS_DATA_DIR="+filepath.Join(checker.root, "data"))
-			execCmd.Dir = checker.root
-			output, err := execCmd.CombinedOutput()
-			if err != nil {
-				return fmt.Errorf("python script failed: %v: %s", err, strings.TrimSpace(string(output)))
-			}
-			if output != nil && len(strings.TrimSpace(string(output))) > 0 {
-				log.Printf("[LISTS] python/get.py output: %s", strings.TrimSpace(string(output)))
-			}
-			return nil
-		}
-	}
-	return errors.New("python interpreter not found")
+	return runPythonListUpdater(checker.root)
 }
 
 func (checker *siteChecker) fetchHashMap(ctx context.Context, sourceURL string) (map[string][]string, error) {
@@ -367,6 +446,14 @@ func proxyRoot() (string, error) {
 
 func main() {
 	flag.Parse()
+	installed, err := installApplication()
+	if err != nil {
+		log.Printf("[INSTALL] installation failed: %v", err)
+		return
+	}
+	if installed {
+		return
+	}
 	log.Printf("Starting NicetOS proxy on %s", *listenAddress)
 
 	root, err := proxyRoot()
@@ -382,9 +469,23 @@ func main() {
 	checker.startListRefresh(listRefreshStop)
 	defer close(listRefreshStop)
 
+	ollama, err := startBundledOllama(root)
+	if err != nil {
+		log.Printf("[OLLAMA] local AI unavailable: %v; non-whitelisted domains will be blocked", err)
+	} else {
+		defer func() {
+			if closeErr := ollama.Close(); closeErr != nil {
+				log.Printf("[OLLAMA] failed to stop local server: %v", closeErr)
+			}
+		}()
+		checker.ollamaAPI = ollama.apiURL
+		log.Printf("[OLLAMA] project-local model is ready at %s", ollama.apiURL)
+	}
+
 	server, err := proxy.StartTransparentProxy(*listenAddress, checker)
 	if err != nil {
-		log.Fatalf("Failed to start proxy: %v", err)
+		log.Printf("Failed to start proxy: %v", err)
+		return
 	}
 	log.Println("Proxy started successfully")
 
@@ -406,6 +507,6 @@ func main() {
 
 	log.Printf("NicetOS transparent proxy listening on %s; press Ctrl+C to stop", *listenAddress)
 	if err := server.Serve(); err != nil && !errors.Is(err, net.ErrClosed) {
-		log.Fatalf("Proxy serve error: %v", err)
+		log.Printf("Proxy serve error: %v", err)
 	}
 }

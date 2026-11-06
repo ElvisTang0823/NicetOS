@@ -72,3 +72,23 @@ func TestBasicConnectBlockedResponseRendersHTML(t *testing.T) {
 		t.Fatalf("expected blocked page HTML, got %q", body)
 	}
 }
+
+func TestBlockedPageEscapesDynamicReason(t *testing.T) {
+	root := t.TempDir()
+	pageDir := filepath.Join(root, "assets")
+	if err := os.MkdirAll(pageDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	page := filepath.Join(pageDir, "index.html")
+	if err := os.WriteFile(page, []byte("<p>{{BLOCK_REASON}}</p>"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	body, err := readBlockedPageBody(&testChecker{root: root}, `<script>alert("x")</script>`)
+	if err != nil {
+		t.Fatalf("render blocked page: %v", err)
+	}
+	if strings.Contains(string(body), "<script>") || !strings.Contains(string(body), "&lt;script&gt;") {
+		t.Fatalf("dynamic reason was not safely escaped: %s", body)
+	}
+}

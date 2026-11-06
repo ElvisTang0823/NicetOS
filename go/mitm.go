@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"html"
 	"math/big"
 	"net"
 	"os"
@@ -143,6 +144,15 @@ func certificateHost(host string) string {
 	return strings.Trim(strings.TrimSpace(host), "[]")
 }
 
-func readBlockedPageBody(checker URLChecker) ([]byte, error) {
-	return os.ReadFile(checker.BlockedPagePath())
+func readBlockedPageBody(checker URLChecker, reasons ...string) ([]byte, error) {
+	body, err := os.ReadFile(checker.BlockedPagePath())
+	if err != nil {
+		return nil, err
+	}
+	reason := ""
+	if len(reasons) > 0 {
+		reason = reasons[0]
+	}
+	body = []byte(strings.ReplaceAll(string(body), "{{BLOCK_REASON}}", html.EscapeString(reason)))
+	return body, nil
 }

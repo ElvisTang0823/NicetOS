@@ -18,13 +18,9 @@ except ModuleNotFoundError:
 
 REQUESTS_IMPORT_ERROR = None
 try:
-    import requests
-    missing_requests_api = [name for name in ("get", "post", "exceptions") if not hasattr(requests, name)]
-    if missing_requests_api:
-        module_path = getattr(requests, "__file__", "<unknown>")
-        raise ImportError(
-            f"requests module at {module_path} is missing: {', '.join(missing_requests_api)}"
-        )
+    from python.requests_loader import load_requests
+
+    requests = load_requests(BASE_DIR)
 except ImportError as exc:  # pragma: no cover - only used for optional AI fallback
     REQUESTS_IMPORT_ERROR = str(exc)
     requests = None

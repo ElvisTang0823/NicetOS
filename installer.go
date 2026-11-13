@@ -183,16 +183,20 @@ func installOllamaBundle(installDir string) error {
 		return err
 	}
 
+	downloadDir := filepath.Join(installDir, ".ollama-download-"+ollamaBundleVersion)
+	if err := os.MkdirAll(downloadDir, 0755); err != nil {
+		return fmt.Errorf("create persistent Ollama download directory: %w", err)
+	}
+	archivePath := filepath.Join(downloadDir, metadata.ArchiveName)
+	if err := downloadBundleArchive(manifestURL, metadata, archivePath); err != nil {
+		return err
+	}
 	temporary, err := os.MkdirTemp(installDir, ".ollama-install-*")
 	if err != nil {
 		return fmt.Errorf("create temporary installation directory: %w", err)
 	}
 	defer os.RemoveAll(temporary)
 
-	archivePath := filepath.Join(temporary, metadata.ArchiveName)
-	if err := downloadBundleArchive(manifestURL, metadata, archivePath); err != nil {
-		return err
-	}
 	extractDir := filepath.Join(temporary, "extracted")
 	if err := os.MkdirAll(extractDir, 0755); err != nil {
 		return err
@@ -208,6 +212,9 @@ func installOllamaBundle(installDir string) error {
 	}
 	if err := os.WriteFile(markerPath, []byte(ollamaBundleVersion+"\n"), 0644); err != nil {
 		return err
+	}
+	if err := os.RemoveAll(downloadDir); err != nil {
+		log.Printf("[INSTALL] Installation succeeded, but could not remove download cache %s: %v", downloadDir, err)
 	}
 	return nil
 }
@@ -285,13 +292,23 @@ type bundleDownloadProgress struct {
 }
 
 func (progress *bundleDownloadProgress) Write(data []byte) (int, error) {
+	progress.add(int64(len(data)))
+	return len(data), nil
+}
+
+func (progress *bundleDownloadProgress) add(size int64) {
 	progress.mu.Lock()
 	defer progress.mu.Unlock()
-	progress.downloaded += int64(len(data))
+	progress.downloaded += size
+	if progress.downloaded < 0 {
+		progress.downloaded = 0
+	}
+	if progress.downloaded > progress.totalBytes {
+		progress.downloaded = progress.totalBytes
+	}
 	if time.Since(progress.lastReportedAt) >= 2*time.Second {
 		progress.reportLocked()
 	}
-	return len(data), nil
 }
 
 func (progress *bundleDownloadProgress) report() {
@@ -330,6 +347,16 @@ func formatBundleBytes(size int64) string {
 
 func downloadBundleArchive(manifestURL string, metadata ollamaBundleMetadata, archivePath string) error {
 	baseURL := strings.TrimSuffix(manifestURL, ollamaBundleManifest)
+	if valid, err := verifyBundleFile(archivePath, metadata.ArchiveSize, metadata.ArchiveSHA); err != nil {
+		return fmt.Errorf("verify existing Ollama archive: %w", err)
+	} else if valid {
+		log.Printf("[INSTALL] Reusing verified Ollama archive at %s", archivePath)
+		return nil
+	}
+	if err := os.Remove(archivePath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove invalid cached Ollama archive: %w", err)
+	}
+
 	client := &http.Client{Timeout: time.Hour}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -361,7 +388,11 @@ func downloadBundleArchive(manifestURL string, metadata ollamaBundleMetadata, ar
 		return firstDownloadError
 	}
 
-	archive, err := os.Create(archivePath)
+	assemblingPath := archivePath + ".assembling"
+	if err := os.Remove(assemblingPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove incomplete archive assembly: %w", err)
+	}
+	archive, err := os.Create(assemblingPath)
 	if err != nil {
 		return err
 	}
@@ -389,67 +420,160 @@ func downloadBundleArchive(manifestURL string, metadata ollamaBundleMetadata, ar
 			return fmt.Errorf("release part %s has size %d during assembly, expected %d", part.Name, written, part.Size)
 		}
 		total += written
-		if err := os.Remove(partPath); err != nil {
-			_ = archive.Close()
-			return fmt.Errorf("remove assembled release part %s: %w", part.Name, err)
-		}
 		log.Printf("[INSTALL] Verified and assembled release part %d/%d", index+1, len(metadata.Parts))
 	}
 	closeErr := archive.Close()
 	if closeErr != nil {
-		return closeErr
+		return errors.Join(closeErr, os.Remove(assemblingPath))
 	}
 	if total != metadata.ArchiveSize || !strings.EqualFold(hex.EncodeToString(archiveHash.Sum(nil)), metadata.ArchiveSHA) {
+		_ = os.Remove(assemblingPath)
 		return errors.New("downloaded Ollama archive failed size or SHA-256 verification")
+	}
+	if err := os.Rename(assemblingPath, archivePath); err != nil {
+		return fmt.Errorf("finalize downloaded Ollama archive: %w", err)
+	}
+	for _, part := range metadata.Parts {
+		if err := os.Remove(filepath.Join(filepath.Dir(archivePath), part.Name)); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove completed download part %s: %w", part.Name, err)
+		}
 	}
 	return nil
 }
 
-func downloadBundlePart(parent context.Context, client *http.Client, url string, part ollamaBundlePart, path string, progress io.Writer) error {
+func verifyBundleFile(path string, expectedSize int64, expectedSHA string) (bool, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return false, err
+	}
+	if info.Size() != expectedSize {
+		return false, nil
+	}
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return false, err
+	}
+	return strings.EqualFold(hex.EncodeToString(hash.Sum(nil)), expectedSHA), nil
+}
+
+func downloadBundlePart(parent context.Context, client *http.Client, url string, part ollamaBundlePart, path string, progress *bundleDownloadProgress) error {
+	if valid, err := verifyBundleFile(path, part.Size, part.SHA256); err != nil {
+		return fmt.Errorf("verify cached part: %w", err)
+	} else if valid {
+		progress.add(part.Size)
+		log.Printf("[INSTALL] Reusing verified download part %s", part.Name)
+		return nil
+	}
+
+	offset := int64(0)
+	if info, err := os.Stat(path); err == nil {
+		offset = info.Size()
+		if offset < 0 || offset >= part.Size {
+			if err := os.Remove(path); err != nil {
+				return fmt.Errorf("remove invalid partial download: %w", err)
+			}
+			offset = 0
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect partial download: %w", err)
+	}
+	progress.add(offset)
+
 	ctx, cancel := context.WithTimeout(parent, time.Hour)
 	defer cancel()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
+		progress.add(-offset)
 		return err
+	}
+	if offset > 0 {
+		request.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 	}
 	response, err := client.Do(request)
 	if err != nil {
 		return err
 	}
-	if response.StatusCode != http.StatusOK {
+	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusPartialContent {
 		status := response.Status
 		if err := response.Body.Close(); err != nil {
 			return errors.Join(fmt.Errorf("HTTP %s", status), err)
 		}
 		return fmt.Errorf("HTTP %s", status)
 	}
-	output, err := os.Create(path)
+	if response.StatusCode == http.StatusPartialContent {
+		start, end, size, err := parseBundleContentRange(response.Header.Get("Content-Range"))
+		if err != nil || start != offset || end != part.Size-1 || size != part.Size {
+			_ = response.Body.Close()
+			if err != nil {
+				return fmt.Errorf("invalid Content-Range: %w", err)
+			}
+			return fmt.Errorf("unexpected Content-Range %q for offset %d and size %d", response.Header.Get("Content-Range"), offset, part.Size)
+		}
+	} else if offset > 0 {
+		log.Printf("[INSTALL] Server does not support resuming %s; restarting this part", part.Name)
+		progress.add(-offset)
+		offset = 0
+	}
+
+	flags := os.O_CREATE | os.O_WRONLY
+	if offset == 0 {
+		flags |= os.O_TRUNC
+	} else {
+		flags |= os.O_APPEND
+	}
+	output, err := os.OpenFile(path, flags, 0644)
 	if err != nil {
 		_ = response.Body.Close()
+		progress.add(-offset)
 		return err
 	}
-	partHash := sha256.New()
-	written, copyErr := io.Copy(io.MultiWriter(output, partHash, progress), io.LimitReader(response.Body, part.Size+1))
+	written, copyErr := io.Copy(io.MultiWriter(output, progress), io.LimitReader(response.Body, part.Size-offset+1))
 	bodyCloseErr := response.Body.Close()
 	outputCloseErr := output.Close()
 	if copyErr != nil {
-		_ = os.Remove(path)
 		return errors.Join(copyErr, bodyCloseErr, outputCloseErr)
 	}
 	if bodyCloseErr != nil || outputCloseErr != nil {
-		_ = os.Remove(path)
 		return errors.Join(bodyCloseErr, outputCloseErr)
 	}
-	if written != part.Size {
+	totalWritten := offset + written
+	if totalWritten > part.Size {
+		progress.add(-totalWritten)
 		_ = os.Remove(path)
-		return fmt.Errorf("size is %d bytes, expected %d", written, part.Size)
+		return fmt.Errorf("download exceeded expected size %d bytes", part.Size)
 	}
-	if !strings.EqualFold(hex.EncodeToString(partHash.Sum(nil)), part.SHA256) {
+	if totalWritten < part.Size {
+		return fmt.Errorf("download paused at %s of %s; rerun the installer to resume",
+			formatBundleBytes(totalWritten), formatBundleBytes(part.Size))
+	}
+	if valid, err := verifyBundleFile(path, part.Size, part.SHA256); err != nil {
+		return fmt.Errorf("verify downloaded part: %w", err)
+	} else if !valid {
+		progress.add(-totalWritten)
 		_ = os.Remove(path)
-		return errors.New("SHA-256 verification failed")
+		return errors.New("SHA-256 verification failed; the incomplete part was discarded")
 	}
-	log.Printf("[INSTALL] Downloaded and verified %s (%s)", part.Name, formatBundleBytes(written))
+	log.Printf("[INSTALL] Downloaded and verified %s (%s)", part.Name, formatBundleBytes(part.Size))
 	return nil
+}
+
+func parseBundleContentRange(value string) (int64, int64, int64, error) {
+	var start, end, size int64
+	if _, err := fmt.Sscanf(value, "bytes %d-%d/%d", &start, &end, &size); err != nil {
+		return 0, 0, 0, fmt.Errorf("parse %q: %w", value, err)
+	}
+	if start < 0 || end < start || size <= end {
+		return 0, 0, 0, fmt.Errorf("invalid range values in %q", value)
+	}
+	return start, end, size, nil
 }
 
 func extractOllamaArchive(archivePath string, destination string, expectedSize int64) error {

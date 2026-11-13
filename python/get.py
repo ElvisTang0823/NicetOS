@@ -1,6 +1,20 @@
-import requests
-from datetime import datetime
 import os
+import sys
+from datetime import datetime
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
+BUNDLED_SITE_PACKAGES = os.path.join(ROOT_DIR, "python_runtime", "Lib", "site-packages")
+if os.path.isdir(BUNDLED_SITE_PACKAGES):
+    sys.path.insert(0, BUNDLED_SITE_PACKAGES)
+
+import requests
+
+missing_requests_api = [name for name in ("get", "exceptions") if not hasattr(requests, name)]
+if missing_requests_api:
+    module_path = getattr(requests, "__file__", "<unknown>")
+    raise ImportError(
+        f"requests module at {module_path} is missing: {', '.join(missing_requests_api)}"
+    )
 
 # 設定要下載的名單（可自行增減）
 LISTS = {
@@ -8,7 +22,6 @@ LISTS = {
     "whitelist": "https://raw.githubusercontent.com/ElvisTang0823/NicetOS/main/data/whitelist.json",
 }
 
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
 SAVE_DIR = os.environ.get("NICETOS_DATA_DIR", os.path.join(ROOT_DIR, "data"))
 
 

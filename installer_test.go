@@ -122,6 +122,67 @@ func TestDownloadBundleArchiveDownloadsPartsConcurrently(t *testing.T) {
 	}
 }
 
+func TestDownloadBundleArchiveResumesInterruptedPart(t *testing.T) {
+	payload := []byte("resumable test payload")
+	resumeAt := int64(8)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if requests.Add(1) == 1 {
+			_, _ = response.Write(payload[:resumeAt])
+			return
+		}
+		if got := request.Header.Get("Range"); got != fmt.Sprintf("bytes=%d-", resumeAt) {
+			http.Error(response, "missing or incorrect Range header", http.StatusBadRequest)
+			return
+		}
+		response.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", resumeAt, len(payload)-1, len(payload)))
+		response.WriteHeader(http.StatusPartialContent)
+		_, _ = response.Write(payload[resumeAt:])
+	}))
+	defer server.Close()
+
+	hash := sha256.Sum256(payload)
+	part := ollamaBundlePart{
+		Name:   "ollama-bundle.tar.gz.part001",
+		Size:   int64(len(payload)),
+		SHA256: hex.EncodeToString(hash[:]),
+	}
+	archivePath := filepath.Join(t.TempDir(), "ollama-bundle.tar.gz")
+	manifestURL := fmt.Sprintf("%s/%s", server.URL, ollamaBundleManifest)
+	metadata := ollamaBundleMetadata{
+		ArchiveName: "ollama-bundle.tar.gz",
+		ArchiveSize: part.Size,
+		ArchiveSHA:  part.SHA256,
+		Parts:       []ollamaBundlePart{part},
+	}
+
+	if err := downloadBundleArchive(manifestURL, metadata, archivePath); err == nil {
+		t.Fatal("expected the first interrupted download to fail")
+	}
+	partPath := filepath.Join(filepath.Dir(archivePath), part.Name)
+	partial, err := os.ReadFile(partPath)
+	if err != nil {
+		t.Fatalf("read preserved partial download: %v", err)
+	}
+	if string(partial) != string(payload[:resumeAt]) {
+		t.Fatalf("preserved partial = %q, want %q", partial, payload[:resumeAt])
+	}
+
+	if err := downloadBundleArchive(manifestURL, metadata, archivePath); err != nil {
+		t.Fatalf("resume and assemble bundle: %v", err)
+	}
+	assembled, err := os.ReadFile(archivePath)
+	if err != nil {
+		t.Fatalf("read assembled archive: %v", err)
+	}
+	if string(assembled) != string(payload) {
+		t.Fatalf("assembled archive = %q, want %q", assembled, payload)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("server received %d requests, want 2", got)
+	}
+}
+
 func TestReplaceOllamaDirectoriesRollsBackOnFailure(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "new")

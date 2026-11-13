@@ -2,17 +2,31 @@
 import json
 import os
 import re
+import sys
 import time
 from urllib.parse import urlparse
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BUNDLED_SITE_PACKAGES = os.path.join(BASE_DIR, "python_runtime", "Lib", "site-packages")
+if os.path.isdir(BUNDLED_SITE_PACKAGES):
+    sys.path.insert(0, BUNDLED_SITE_PACKAGES)
 
 try:
     from hash import get_stable_hash
 except ModuleNotFoundError:
     from python.hash import get_stable_hash
 
+REQUESTS_IMPORT_ERROR = None
 try:
     import requests
-except ImportError:  # pragma: no cover - only used for optional AI fallback
+    missing_requests_api = [name for name in ("get", "post", "exceptions") if not hasattr(requests, name)]
+    if missing_requests_api:
+        module_path = getattr(requests, "__file__", "<unknown>")
+        raise ImportError(
+            f"requests module at {module_path} is missing: {', '.join(missing_requests_api)}"
+        )
+except ImportError as exc:  # pragma: no cover - only used for optional AI fallback
+    REQUESTS_IMPORT_ERROR = str(exc)
     requests = None
 
 try:
@@ -66,7 +80,6 @@ def domain_in_bucket(bucket: list[str], domain: str) -> bool:
 # ===========================
 # 讀取白名單 / 黑名單
 # 以 main.py 自身所在目錄為資料根，不再依賴執行時的工作目錄
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, 'data')
 
 whitelist = load_hash_map(os.path.join(DATA_DIR, 'whitelist.json'))
@@ -267,6 +280,16 @@ def check_url_with_details(input_link):
     if hash_key in whitelist and domain_in_bucket(whitelist[hash_key], domain):
         details = result("ALLOW", "白名單", 1.0, f"{domain} 命中本機白名單。", "NicetOS 白名單")
         set_cached_decision(input_link, True, details)
+        return details
+
+    if requests is None:
+        queue_retry(input_link)
+        reason = "Gemma4 無法呼叫：Python requests 套件載入失敗。"
+        if REQUESTS_IMPORT_ERROR:
+            reason += f" {REQUESTS_IMPORT_ERROR[:300]}"
+        reason += " 依安全規則封鎖非白名單網址。"
+        details = result("UNKNOWN", "AI 模組不可用", 0.0, reason, "NicetOS")
+        set_cached_decision(input_link, 0, details)
         return details
 
     try:

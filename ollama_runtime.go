@@ -17,6 +17,7 @@ import (
 )
 
 const bundledModelName = "gemma4-child-safety"
+const ollamaInferenceCheckTimeout = 5 * time.Minute
 
 type bundledOllama struct {
 	apiURL    string
@@ -27,6 +28,7 @@ type bundledOllama struct {
 }
 
 func startBundledOllama(root string) (*bundledOllama, error) {
+	log.Println("[OLLAMA] compatibility check: validating the bundled Windows runtime and model files")
 	binDir := filepath.Join(root, "ollama", "bin")
 	executable := filepath.Join(binDir, "ollama.exe")
 	if info, err := os.Stat(executable); err != nil {
@@ -34,6 +36,7 @@ func startBundledOllama(root string) (*bundledOllama, error) {
 	} else if info.IsDir() {
 		return nil, fmt.Errorf("project-local executable path is a directory: %s", executable)
 	}
+	log.Println("[OLLAMA] bundled executable found")
 
 	sourceDir := filepath.Join(root, "ollama", "models")
 	modelfile := filepath.Join(sourceDir, "Modelfile")
@@ -43,6 +46,7 @@ func startBundledOllama(root string) (*bundledOllama, error) {
 			return nil, fmt.Errorf("required model source file %s: %w", path, err)
 		}
 	}
+	log.Println("[OLLAMA] bundled model files found; CPU inference is supported when GPU acceleration is unavailable")
 
 	modelStore := filepath.Join(root, "ollama", "runtime-models")
 	if err := os.MkdirAll(modelStore, 0755); err != nil {
@@ -59,6 +63,7 @@ func startBundledOllama(root string) (*bundledOllama, error) {
 	}
 
 	apiURL := "http://" + address
+	log.Println("[OLLAMA] starting local runtime to verify computer compatibility")
 	server := exec.Command(executable, "serve")
 	server.Env = ollamaEnvironment(os.Environ(), address, modelStore)
 	server.Stdout = os.Stderr
@@ -80,10 +85,17 @@ func startBundledOllama(root string) (*bundledOllama, error) {
 		_ = runtime.Close()
 		return nil, err
 	}
+	log.Println("[OLLAMA] local API is responding")
 	if err := runtime.ensureModel(executable, sourceDir, modelfile, modelStore); err != nil {
 		_ = runtime.Close()
 		return nil, err
 	}
+	log.Println("[OLLAMA] testing Gemma4 inference on this computer; first model load may take several minutes")
+	if err := runtime.checkModelInference(); err != nil {
+		_ = runtime.Close()
+		return nil, fmt.Errorf("Gemma4 inference compatibility check failed: %w", err)
+	}
+	log.Println("[OLLAMA] compatibility check passed: bundled runtime and Gemma4 inference are usable")
 	return runtime, nil
 }
 
@@ -194,6 +206,53 @@ func (runtime *bundledOllama) hasModel() (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+func (runtime *bundledOllama) checkModelInference() error {
+	ctx, cancel := context.WithTimeout(context.Background(), ollamaInferenceCheckTimeout)
+	defer cancel()
+
+	payload := map[string]any{
+		"model": bundledModelName,
+		"messages": []map[string]string{
+			{"role": "user", "content": "Reply with OK only."},
+		},
+		"stream":     false,
+		"keep_alive": "1h",
+		"options":    map[string]int{"num_predict": 4},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encode inference check request: %w", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, runtime.apiURL+"/api/chat", strings.NewReader(string(body)))
+	if err != nil {
+		return fmt.Errorf("create inference check request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := (&http.Client{Timeout: ollamaInferenceCheckTimeout}).Do(request)
+	if err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("inference check timed out after %s: %w", ollamaInferenceCheckTimeout, ctx.Err())
+		}
+		return fmt.Errorf("send inference check request: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("inference check returned %s", response.Status)
+	}
+	var result struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		return fmt.Errorf("decode inference check response: %w", err)
+	}
+	if strings.TrimSpace(result.Message.Content) == "" {
+		return errors.New("inference check returned an empty response")
+	}
+	return nil
 }
 
 func (runtime *bundledOllama) Close() error {

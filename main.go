@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/json"
@@ -186,7 +187,12 @@ func pythonCheckURLWithDetails(root string, target string, ollamaAPI string) (de
 	command := exec.CommandContext(ctx, python, args...)
 	command.Env = append(replaceEnvironment(os.Environ(), "PYTHONPATH", "NICETOS_OLLAMA_API"),
 		"PYTHONPATH="+root, "NICETOS_OLLAMA_API="+ollamaAPI)
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
 	output, err := command.Output()
+	if diagnostic := strings.TrimSpace(stderr.String()); diagnostic != "" {
+		log.Printf("[AI] Python: %s", diagnostic)
+	}
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return decisionDetails{}, proxy.ErrUnknownDecision
@@ -250,14 +256,17 @@ func (checker *siteChecker) CheckWithReason(target string) (bool, string, error)
 	key := domainHashKey(domain)
 	for _, blocked := range lists.blacklist[key] {
 		if blocked == domain {
+			log.Printf("[CHECK] %s matched local blacklist; skipping Ollama", domain)
 			return false, fmt.Sprintf("分類：黑名單\n判斷依據：%s 命中 NicetOS 黑名單。", domain), nil
 		}
 	}
 	for _, allowed := range lists.whitelist[key] {
 		if allowed == domain {
+			log.Printf("[CHECK] %s matched local whitelist; skipping Ollama", domain)
 			return true, "", nil
 		}
 	}
+	log.Printf("[CHECK] %s did not match local lists; requesting Gemma4", domain)
 	details, err := pythonCheckURLWithDetails(checker.root, target, checker.ollamaAPI)
 	if err != nil {
 		if errors.Is(err, proxy.ErrUnknownDecision) {
@@ -471,7 +480,7 @@ func main() {
 
 	ollama, err := startBundledOllama(root)
 	if err != nil {
-		log.Printf("[OLLAMA] local AI unavailable: %v; non-whitelisted domains will be blocked", err)
+		log.Printf("[OLLAMA] compatibility check FAILED: %v; local AI unavailable and non-whitelisted domains will be blocked", err)
 	} else {
 		defer func() {
 			if closeErr := ollama.Close(); closeErr != nil {

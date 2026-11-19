@@ -179,12 +179,18 @@ def fetch_webpage_info(url: str):
 
 def check_url_safety(url: str):
     """自動爬取網頁並呼叫 Ollama 判斷兒少安全性"""
-    if requests is None or not OLLAMA_API.startswith("http://127.0.0.1:"):
+    if requests is None:
+        print("Gemma4 request skipped: Python requests is unavailable.", file=sys.stderr)
+        return None
+    if not OLLAMA_API.startswith("http://127.0.0.1:"):
+        print("Gemma4 request skipped: local Ollama API URL is not configured.", file=sys.stderr)
         return None
 
     title, content = fetch_webpage_info(url)
     if not title:
-        return None
+        title = "無法取得網頁標題"
+        content = "無法取得網頁內容，請根據網址本身判斷。"
+        print("Page content unavailable; sending URL-only context to Ollama.", file=sys.stderr)
 
     user_prompt = f"""[網頁資訊]
 網址: {url}
@@ -226,7 +232,8 @@ def check_url_safety(url: str):
         if json_match:
             clean_str = json_match.group(0)
         return json.loads(clean_str)
-    except Exception:
+    except Exception as exc:
+        print(f"Ollama API request failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return None
 
 

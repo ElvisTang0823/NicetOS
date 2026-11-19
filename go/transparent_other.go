@@ -18,19 +18,21 @@ func StartTransparentProxy(address string, checker URLChecker) (*TransparentProx
 	if err != nil {
 		return nil, err
 	}
-	ca, err := newCertificateAuthority(checker)
+	ca, err := newEphemeralCertificateAuthority()
 	if err != nil {
 		_ = listener.Close()
 		return nil, err
 	}
 	restore, err := configurePlatformProxy(address)
 	if err != nil {
+		_ = ca.close()
 		_ = listener.Close()
 		return nil, err
 	}
 	trustRestore, err := configureCertificateTrust(ca.certPath)
 	if err != nil {
 		_ = restore()
+		_ = ca.close()
 		_ = listener.Close()
 		return nil, err
 	}
@@ -106,6 +108,12 @@ func (proxy *TransparentProxy) Close() error {
 			if err == nil {
 				err = trustErr
 			}
+		}
+	}
+	if caErr := proxy.ca.close(); caErr != nil {
+		log.Printf("[PROXY] CA cleanup error: %v", caErr)
+		if err == nil {
+			err = caErr
 		}
 	}
 

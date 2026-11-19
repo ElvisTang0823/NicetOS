@@ -22,6 +22,11 @@ func TestCertificateAuthorityIssuesVerifiableHostCertificate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create authority: %v", err)
 	}
+	defer func() {
+		if err := authority.close(); err != nil {
+			t.Errorf("remove temporary CA certificate: %v", err)
+		}
+	}()
 	certificate, err := authority.certificateFor("example.com:443")
 	if err != nil {
 		t.Fatalf("issue certificate: %v", err)
@@ -34,6 +39,50 @@ func TestCertificateAuthorityIssuesVerifiableHostCertificate(t *testing.T) {
 	roots.AddCert(authority.parsed)
 	if _, err := leaf.Verify(x509.VerifyOptions{DNSName: "example.com", Roots: roots}); err != nil {
 		t.Fatalf("issued certificate did not verify for requested host: %v", err)
+	}
+}
+
+func TestCertificateAuthorityIsFreshAndDoesNotPersistPrivateKey(t *testing.T) {
+	first, err := newEphemeralCertificateAuthority()
+	if err != nil {
+		t.Fatalf("create first authority: %v", err)
+	}
+	defer func() {
+		if err := first.close(); err != nil {
+			t.Errorf("remove first temporary CA certificate: %v", err)
+		}
+	}()
+	second, err := newEphemeralCertificateAuthority()
+	if err != nil {
+		t.Fatalf("create second authority: %v", err)
+	}
+	defer func() {
+		if err := second.close(); err != nil {
+			t.Errorf("remove second temporary CA certificate: %v", err)
+		}
+	}()
+
+	if first.parsed.SerialNumber.Cmp(second.parsed.SerialNumber) == 0 {
+		t.Fatal("expected a fresh CA serial number for each startup")
+	}
+	if string(first.parsed.RawSubjectPublicKeyInfo) == string(second.parsed.RawSubjectPublicKeyInfo) {
+		t.Fatal("expected a fresh CA key for each startup")
+	}
+
+	for _, authority := range []*certificateAuthority{first, second} {
+		contents, err := os.ReadFile(authority.certPath)
+		if err != nil {
+			t.Fatalf("read temporary CA certificate: %v", err)
+		}
+		if strings.Contains(string(contents), "PRIVATE KEY") {
+			t.Fatal("temporary CA certificate file must not contain private key material")
+		}
+		if err := authority.close(); err != nil {
+			t.Fatalf("remove temporary CA certificate: %v", err)
+		}
+		if _, err := os.Stat(authority.certPath); !os.IsNotExist(err) {
+			t.Fatalf("expected temporary CA certificate to be removed, stat error: %v", err)
+		}
 	}
 }
 

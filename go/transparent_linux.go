@@ -66,11 +66,15 @@ func (proxy *TransparentProxy) Serve() error {
 func (proxy *TransparentProxy) Close() error {
 	listenerErr := proxy.listener.Close()
 	firewallErr := removeFirewall(proxy.chain)
+	caErr := proxy.ca.close()
 	close(proxy.done)
 	if listenerErr != nil {
 		return listenerErr
 	}
-	return firewallErr
+	if firewallErr != nil {
+		return firewallErr
+	}
+	return caErr
 }
 
 func (proxy *TransparentProxy) acceptLoop(checker URLChecker, ca *certificateAuthority) {

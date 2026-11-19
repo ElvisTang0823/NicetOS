@@ -3,5 +3,7 @@ ubuntu-24.04.4-desktop-amd64.iso
 **/__pycache__/
 release/
 /release-assets/
+/data/nicetos-proxy-ca-cert.pem
+/data/nicetos-proxy-ca-key.pem
 ollama\models\gemma4_child_safety_q4.gguf
 /ollama/

@@ -25,6 +25,7 @@ type certificateAuthority struct {
 	parsed      *x509.Certificate
 	privateKey  *rsa.PrivateKey
 	certPath    string
+	removeCert  bool
 	mu          sync.Mutex
 	issued      map[string]tls.Certificate
 }
@@ -41,7 +42,8 @@ func (connection *readerConn) Read(buffer []byte) (int, error) { return connecti
 func newCertificateAuthority(checker URLChecker) (*certificateAuthority, error) {
 	root := filepath.Dir(filepath.Dir(checker.BlockedPagePath()))
 	directory := filepath.Join(root, "data")
-	certPath, keyPath := filepath.Join(directory, "nicetos-proxy-ca-cert.pem"), filepath.Join(directory, "nicetos-proxy-ca-key.pem")
+	certPath := filepath.Join(directory, "nicetos-proxy-ca-cert.pem")
+	keyPath := filepath.Join(directory, "nicetos-proxy-ca-key.pem")
 	certPEM, certErr := os.ReadFile(certPath)
 	keyPEM, keyErr := os.ReadFile(keyPath)
 	if os.IsNotExist(certErr) && os.IsNotExist(keyErr) {
@@ -57,24 +59,80 @@ func newCertificateAuthority(checker URLChecker) (*certificateAuthority, error) 
 			return nil, err
 		}
 		if err = os.WriteFile(keyPath, keyPEM, 0600); err != nil {
+			_ = os.Remove(certPath)
 			return nil, err
 		}
 	} else if certErr != nil || keyErr != nil {
 		return nil, fmt.Errorf("both NicetOS CA certificate and key are required: certificate=%w, key=%v", certErr, keyErr)
 	}
+	return parseCertificateAuthority(certPEM, keyPEM, certPath, false)
+}
+
+func newEphemeralCertificateAuthority() (*certificateAuthority, error) {
+	certPEM, keyPEM, err := createCertificateAuthority()
+	if err != nil {
+		return nil, err
+	}
+	certFile, err := os.CreateTemp("", "nicetos-proxy-ca-*.pem")
+	if err != nil {
+		return nil, fmt.Errorf("create temporary CA certificate file: %w", err)
+	}
+	certPath := certFile.Name()
+	if err := certFile.Chmod(0600); err != nil {
+		_ = certFile.Close()
+		_ = os.Remove(certPath)
+		return nil, fmt.Errorf("restrict temporary CA certificate permissions: %w", err)
+	}
+	if _, err := certFile.Write(certPEM); err != nil {
+		_ = certFile.Close()
+		_ = os.Remove(certPath)
+		return nil, fmt.Errorf("write temporary CA certificate: %w", err)
+	}
+	if err := certFile.Close(); err != nil {
+		_ = os.Remove(certPath)
+		return nil, fmt.Errorf("close temporary CA certificate: %w", err)
+	}
+	return parseCertificateAuthority(certPEM, keyPEM, certPath, true)
+}
+
+func parseCertificateAuthority(certPEM []byte, keyPEM []byte, certPath string, removeCert bool) (*certificateAuthority, error) {
+	defer func() {
+		for i := range keyPEM {
+			keyPEM[i] = 0
+		}
+	}()
 	pair, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
+		if removeCert {
+			_ = os.Remove(certPath)
+		}
 		return nil, err
 	}
 	parsed, err := x509.ParseCertificate(pair.Certificate[0])
 	if err != nil {
+		if removeCert {
+			_ = os.Remove(certPath)
+		}
 		return nil, err
 	}
 	key, ok := pair.PrivateKey.(*rsa.PrivateKey)
 	if !ok {
+		if removeCert {
+			_ = os.Remove(certPath)
+		}
 		return nil, fmt.Errorf("NicetOS CA key is not RSA")
 	}
-	return &certificateAuthority{certificate: pair, parsed: parsed, privateKey: key, certPath: certPath, issued: make(map[string]tls.Certificate)}, nil
+	return &certificateAuthority{certificate: pair, parsed: parsed, privateKey: key, certPath: certPath, removeCert: removeCert, issued: make(map[string]tls.Certificate)}, nil
+}
+
+func (authority *certificateAuthority) close() error {
+	if authority == nil || authority.certPath == "" || !authority.removeCert {
+		return nil
+	}
+	if err := os.Remove(authority.certPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove temporary CA certificate: %w", err)
+	}
+	return nil
 }
 
 func createCertificateAuthority() ([]byte, []byte, error) {

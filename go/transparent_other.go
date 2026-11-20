@@ -6,7 +6,6 @@ import (
 	"bufio"
 	"crypto/tls"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -38,45 +37,11 @@ func StartTransparentProxy(address string, checker URLChecker) (*TransparentProx
 	}
 	proxy := &TransparentProxy{listener: listener, done: make(chan struct{}), restore: restore, trustRestore: trustRestore, ca: ca}
 	proxy.server = &http.Server{Handler: http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		target := request.URL.String()
 		if request.Method == http.MethodConnect {
-			target = "https://" + request.Host
-		}
-		log.Printf("[PROXY] Checking: %s", target)
-		allowed, reason, checkErr := checkWithReason(checker, target)
-		if checkErr != nil {
-			if errors.Is(checkErr, ErrUnknownDecision) {
-				log.Printf("[PROXY] Unknown decision for %s: %v (re-queueing retry)", target, checkErr)
-				if request.Method == http.MethodConnect {
-					handleBasicConnect(response, request, checker)
-					return
-				}
-				handleBasicHTTP(response, request)
-				return
-			}
-			log.Printf("[PROXY] Check error for %s: %v (allowing due to error)", target, checkErr)
-			if request.Method == http.MethodConnect {
-				handleBasicConnect(response, request, checker)
-				return
-			}
-			handleBasicHTTP(response, request)
+			handleInspectedConnect(response, request, checker, ca)
 			return
 		}
-		if !allowed {
-			log.Printf("[PROXY] BLOCKED: %s; reason=%q", target, reason)
-			if request.Method == http.MethodConnect {
-				handleBlockedConnect(response, request, checker, ca, reason)
-				return
-			}
-			serveBlockedPage(response, checker, reason)
-			return
-		}
-		log.Printf("[PROXY] ALLOWED: %s", target)
-		if request.Method == http.MethodConnect {
-			handleBasicConnect(response, request, checker)
-			return
-		}
-		handleBasicHTTP(response, request)
+		handleInspectedHTTP(response, request, checker)
 	})}
 	go func() { _ = proxy.server.Serve(listener) }()
 	return proxy, nil
@@ -154,15 +119,6 @@ func handleBlockedConnect(response http.ResponseWriter, request *http.Request, c
 	writeBlockedHTTPResponse(tlsConnection, checker, reason)
 }
 
-func writeBlockedHTTPResponse(writer io.Writer, checker URLChecker, reason string) {
-	body, err := readBlockedPageBody(checker, reason)
-	if err != nil {
-		_, _ = io.WriteString(writer, "HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 24\r\n\r\naccess denied by NicetOS")
-		return
-	}
-	_, _ = fmt.Fprintf(writer, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
-}
-
 func serveBlockedPage(response http.ResponseWriter, checker URLChecker, reason string) {
 	pagePath := checker.BlockedPagePath()
 	body, err := readBlockedPageBody(checker, reason)
@@ -174,16 +130,6 @@ func serveBlockedPage(response http.ResponseWriter, checker URLChecker, reason s
 	response.Header().Set("Content-Type", "text/html; charset=utf-8")
 	response.WriteHeader(http.StatusForbidden)
 	_, _ = response.Write(body)
-}
-
-func checkWithReason(checker URLChecker, target string) (bool, string, error) {
-	if detailed, ok := checker.(interface {
-		CheckWithReason(string) (bool, string, error)
-	}); ok {
-		return detailed.CheckWithReason(target)
-	}
-	allowed, err := checker.Check(target)
-	return allowed, "", err
 }
 
 func handleBasicHTTP(response http.ResponseWriter, request *http.Request) {
@@ -201,6 +147,62 @@ func handleBasicHTTP(response http.ResponseWriter, request *http.Request) {
 	}
 	response.WriteHeader(upstream.StatusCode)
 	_, _ = io.Copy(response, upstream.Body)
+}
+
+func handleInspectedHTTP(response http.ResponseWriter, request *http.Request, checker URLChecker) {
+	target := request.URL.String()
+	if request.Host != "" && !sameHostname(request.URL.Host, request.Host) {
+		serveBlockedPage(response, checker, "HTTP request target 與 Host 不一致，依安全規則封鎖。")
+		return
+	}
+	if known, allowed, reason := knownDecision(checker, target); known && !allowed {
+		serveBlockedPage(response, checker, reason)
+		return
+	}
+	request.RequestURI = ""
+	request.Header.Del("Accept-Encoding")
+	upstream, err := (&http.Transport{}).RoundTrip(request)
+	if err != nil {
+		http.Error(response, "upstream request failed", http.StatusBadGateway)
+		return
+	}
+	defer upstream.Body.Close()
+	allowed, reason, err := inspectResponse(checker, target, upstream)
+	if err != nil {
+		log.Printf("[PROXY] failed to inspect %s: %v", target, err)
+		http.Error(response, "upstream response inspection failed", http.StatusBadGateway)
+		return
+	}
+	if !allowed {
+		serveBlockedPage(response, checker, reason)
+		return
+	}
+	for key, values := range upstream.Header {
+		for _, value := range values {
+			response.Header().Add(key, value)
+		}
+	}
+	response.WriteHeader(upstream.StatusCode)
+	_, _ = io.Copy(response, upstream.Body)
+}
+
+func handleInspectedConnect(response http.ResponseWriter, request *http.Request, checker URLChecker, ca *certificateAuthority) {
+	hijacker, ok := response.(http.Hijacker)
+	if !ok {
+		http.Error(response, "CONNECT is not supported", http.StatusInternalServerError)
+		return
+	}
+	client, buffered, err := hijacker.Hijack()
+	if err != nil {
+		return
+	}
+	defer client.Close()
+	if _, err := client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		return
+	}
+	if err := serveInspectedTLSConnection(client, buffered.Reader, request.Host, checker, ca, nil); err != nil {
+		log.Printf("[PROXY] HTTPS inspection failed for %s: %v", request.Host, err)
+	}
 }
 
 func handleBasicConnect(response http.ResponseWriter, request *http.Request, checker URLChecker) {

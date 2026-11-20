@@ -174,6 +174,25 @@ func TestUnknownGemmaReasonIsPassedToBlockedPage(t *testing.T) {
 	}
 }
 
+func TestPythonCheckURLWithContentPassesProxyBody(t *testing.T) {
+	root := t.TempDir()
+	scriptPath := filepath.Join(root, "main.py")
+	script := `def check_url_with_details(url, page_html=None):
+    decision = "ALLOW" if page_html == b"<html>proxy</html>" else "BLOCK"
+    return {"decision": decision, "category": "test", "confidence": 1.0, "reason": "content received", "source": "test"}`
+	if err := os.WriteFile(scriptPath, []byte(script+"\n"), 0644); err != nil {
+		t.Fatalf("write test script: %v", err)
+	}
+
+	details, err := pythonCheckURLWithContent(root, "https://example.com", "", []byte("<html>proxy</html>"))
+	if err != nil {
+		t.Fatalf("check URL with proxy content: %v", err)
+	}
+	if details.Decision != "ALLOW" {
+		t.Fatalf("expected the Python checker to receive proxy content, got %#v", details)
+	}
+}
+
 func TestUnknownDomainIsBlockedWhenPythonFails(t *testing.T) {
 	root := t.TempDir()
 	scriptPath := filepath.Join(root, "main.py")

@@ -60,10 +60,21 @@ func TestBundledPythonIncludesRequestsPackageFiles(t *testing.T) {
 	if err := writeBundledAssets(root); err != nil {
 		t.Fatalf("extract embedded Python runtime: %v", err)
 	}
+	if err := verifyBundledPythonAssets(root); err != nil {
+		t.Fatalf("verify extracted Python packages: %v", err)
+	}
 	for _, path := range paths {
 		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(path))); err != nil {
 			t.Errorf("extracted Python runtime is missing %s: %v", path, err)
 		}
+	}
+
+	requestsInit := filepath.Join(root, "python_runtime", "Lib", "site-packages", "requests", "__init__.py")
+	if err := os.Remove(requestsInit); err != nil {
+		t.Fatalf("remove Requests entry point for verification test: %v", err)
+	}
+	if err := verifyBundledPythonAssets(root); err == nil {
+		t.Fatal("expected verification to fail when the Requests entry point is missing")
 	}
 }
 

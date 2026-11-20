@@ -70,6 +70,10 @@ func installApplication() (bool, error) {
 	if err := writeBundledAssets(installDir); err != nil {
 		return false, fmt.Errorf("extract embedded application files: %w", err)
 	}
+	if err := verifyBundledPythonAssets(installDir); err != nil {
+		return false, fmt.Errorf("verify extracted Python packages: %w", err)
+	}
+	log.Println("[INSTALL] Embedded Python packages verified: Requests and Beautiful Soup")
 	if err := copyExecutable(executable, installedExecutable); err != nil {
 		return false, fmt.Errorf("install NicetOS executable: %w", err)
 	}

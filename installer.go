@@ -70,10 +70,12 @@ func installApplication() (bool, error) {
 	if err := writeBundledAssets(installDir); err != nil {
 		return false, fmt.Errorf("extract embedded application files: %w", err)
 	}
-	if err := verifyBundledPythonAssets(installDir); err != nil {
-		return false, fmt.Errorf("verify extracted Python packages: %w", err)
+	if err := ensureBundledPythonAssets(installDir); err != nil {
+		log.Printf("[INSTALL] Embedded Python package repair failed (%v); pip will repair them", err)
 	}
-	log.Println("[INSTALL] Embedded Python packages verified: Requests and Beautiful Soup")
+	if err := ensurePythonPackages(installDir); err != nil {
+		return false, fmt.Errorf("install Python packages with pip: %w", err)
+	}
 	if err := copyExecutable(executable, installedExecutable); err != nil {
 		return false, fmt.Errorf("install NicetOS executable: %w", err)
 	}
@@ -120,12 +122,10 @@ func copyExecutable(source string, destination string) error {
 	backup := destination + ".backup"
 	hadPrevious := false
 	if _, err := os.Stat(destination); err == nil {
-		if _, backupErr := os.Stat(backup); backupErr == nil {
+		// 上次安裝中斷留下的備份檔會讓之後永遠無法重新安裝，先把它清掉。
+		if err := os.Remove(backup); err != nil && !os.IsNotExist(err) {
 			_ = os.Remove(temporary)
-			return fmt.Errorf("previous install backup already exists: %s", backup)
-		} else if !os.IsNotExist(backupErr) {
-			_ = os.Remove(temporary)
-			return backupErr
+			return fmt.Errorf("remove stale install backup %s: %w", backup, err)
 		}
 		if err := os.Rename(destination, backup); err != nil {
 			_ = os.Remove(temporary)

@@ -164,7 +164,7 @@ def fetch_webpage_info(url: str):
     }
 
     try:
-        response = HTTP_SESSION.get(url, headers=headers, timeout=15)
+        response = HTTP_SESSION.get(url, headers=headers, timeout=8)
         response.encoding = response.apparent_encoding or "utf-8"
         response.raise_for_status()
 
@@ -230,7 +230,7 @@ def check_url_safety(url: str):
     }
 
     try:
-        response = HTTP_SESSION.post(OLLAMA_API, json=payload, timeout=30)
+        response = HTTP_SESSION.post(OLLAMA_API, json=payload, timeout=45)
         response.raise_for_status()
         result = response.json()
 

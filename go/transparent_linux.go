@@ -63,7 +63,15 @@ func (proxy *TransparentProxy) Serve() error {
 	return net.ErrClosed
 }
 
+// Close 可以安全地重複呼叫（Ctrl+C 和程式結束時都會呼叫一次）。
 func (proxy *TransparentProxy) Close() error {
+	proxy.closeOnce.Do(func() {
+		proxy.closeErr = proxy.closeNow()
+	})
+	return proxy.closeErr
+}
+
+func (proxy *TransparentProxy) closeNow() error {
 	listenerErr := proxy.listener.Close()
 	firewallErr := removeFirewall(proxy.chain)
 	caErr := proxy.ca.close()
@@ -116,16 +124,12 @@ func handleHTTPConnection(connection net.Conn, reader *bufio.Reader, original st
 		host = original
 	}
 	target := "http://" + host + request.URL.RequestURI()
-	allowed, err := checker.Check(target)
-	if err != nil {
-		if errors.Is(err, ErrUnknownDecision) {
-			log.Printf("[PROXY] Unknown decision for %s; re-queueing retry", target)
-		} else {
-			writeBlockedPage(connection, checker)
-			return
+	allowed, reason, err := checkWithReason(checker, target)
+	if err != nil || !allowed {
+		if err != nil {
+			log.Printf("[PROXY] Check error for %s: %v (blocking)", target, err)
 		}
-	} else if !allowed {
-		writeBlockedPage(connection, checker)
+		writeBlockedPage(connection, checker, reason)
 		return
 	}
 
@@ -153,23 +157,17 @@ func handleTLSConnection(connection net.Conn, reader *bufio.Reader, original str
 	host := tlsServerName(clientHello)
 	if host == "" {
 		log.Printf("blocked HTTPS connection without server name to %s", original)
-		if err := serveBlockedTLSPage(connection, reader, checker, original, ca); err != nil {
+		if err := serveBlockedTLSPage(connection, reader, checker, original, ca, "HTTPS 連線沒有提供網域名稱，無法判斷，依安全規則封鎖。"); err != nil {
 			log.Printf("failed to render blocked TLS page for %s: %v", original, err)
 		}
 		return
 	}
-	allowed, err := checker.Check("https://" + host)
-	if err != nil {
-		if errors.Is(err, ErrUnknownDecision) {
-			log.Printf("[PROXY] Unknown decision for %s; re-queueing retry", host)
-		} else {
-			if err := serveBlockedTLSPage(connection, reader, checker, host, ca); err != nil {
-				log.Printf("failed to render blocked TLS page for %s: %v", host, err)
-			}
-			return
+	allowed, reason, err := checkWithReason(checker, "https://"+host)
+	if err != nil || !allowed {
+		if err != nil {
+			log.Printf("[PROXY] Check error for %s: %v (blocking)", host, err)
 		}
-	} else if !allowed {
-		if err := serveBlockedTLSPage(connection, reader, checker, host, ca); err != nil {
+		if err := serveBlockedTLSPage(connection, reader, checker, host, ca, reason); err != nil {
 			log.Printf("failed to render blocked TLS page for %s: %v", host, err)
 		}
 		return
@@ -183,8 +181,8 @@ func handleTLSConnection(connection net.Conn, reader *bufio.Reader, original str
 	_, _ = io.Copy(connection, upstream)
 }
 
-func serveBlockedTLSPage(connection net.Conn, reader *bufio.Reader, checker URLChecker, host string, ca *certificateAuthority) error {
-	body, err := readBlockedPageBody(checker)
+func serveBlockedTLSPage(connection net.Conn, reader *bufio.Reader, checker URLChecker, host string, ca *certificateAuthority, reason string) error {
+	body, err := readBlockedPageBody(checker, reason)
 	if err != nil {
 		return err
 	}
@@ -268,11 +266,10 @@ func tlsServerName(record []byte) string {
 	return ""
 }
 
-func writeBlockedPage(connection net.Conn, checker URLChecker) {
-	pagePath := checker.BlockedPagePath()
-	body, err := os.ReadFile(pagePath)
+func writeBlockedPage(connection net.Conn, checker URLChecker, reason string) {
+	body, err := readBlockedPageBody(checker, reason)
 	if err != nil {
-		log.Printf("[PROXY] Failed to read blocked page %s: %v", pagePath, err)
+		log.Printf("[PROXY] Failed to read blocked page %s: %v", checker.BlockedPagePath(), err)
 		writeProxyError(connection, http.StatusForbidden, "access denied by NicetOS")
 		return
 	}

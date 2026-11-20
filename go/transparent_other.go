@@ -5,12 +5,13 @@ package proxy
 import (
 	"bufio"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"strings"
+	"time"
 )
 
 func StartTransparentProxy(address string, checker URLChecker) (*TransparentProxy, error) {
@@ -38,48 +39,70 @@ func StartTransparentProxy(address string, checker URLChecker) (*TransparentProx
 	}
 	proxy := &TransparentProxy{listener: listener, done: make(chan struct{}), restore: restore, trustRestore: trustRestore, ca: ca}
 	proxy.server = &http.Server{Handler: http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		target := request.URL.String()
-		if request.Method == http.MethodConnect {
-			target = "https://" + request.Host
-		}
-		log.Printf("[PROXY] Checking: %s", target)
-		allowed, reason, checkErr := checkWithReason(checker, target)
-		if checkErr != nil {
-			if errors.Is(checkErr, ErrUnknownDecision) {
-				log.Printf("[PROXY] Unknown decision for %s: %v (re-queueing retry)", target, checkErr)
-				if request.Method == http.MethodConnect {
-					handleBasicConnect(response, request, checker)
-					return
-				}
-				handleBasicHTTP(response, request)
-				return
-			}
-			log.Printf("[PROXY] Check error for %s: %v (allowing due to error)", target, checkErr)
-			if request.Method == http.MethodConnect {
-				handleBasicConnect(response, request, checker)
-				return
-			}
-			handleBasicHTTP(response, request)
-			return
-		}
-		if !allowed {
-			log.Printf("[PROXY] BLOCKED: %s; reason=%q", target, reason)
-			if request.Method == http.MethodConnect {
-				handleBlockedConnect(response, request, checker, ca, reason)
-				return
-			}
-			serveBlockedPage(response, checker, reason)
-			return
-		}
-		log.Printf("[PROXY] ALLOWED: %s", target)
-		if request.Method == http.MethodConnect {
-			handleBasicConnect(response, request, checker)
-			return
-		}
-		handleBasicHTTP(response, request)
+		handleProxyRequest(response, request, checker, ca)
 	})}
 	go func() { _ = proxy.server.Serve(listener) }()
 	return proxy, nil
+}
+
+// handleProxyRequest 每個連線只檢查一次網址；無法判斷或檢查出錯時一律封鎖。
+func handleProxyRequest(response http.ResponseWriter, request *http.Request, checker URLChecker, ca *certificateAuthority) {
+	isConnect := request.Method == http.MethodConnect
+	host := request.Host
+	if !isConnect && request.URL.Host != "" {
+		host = request.URL.Host
+	}
+	// 本機位址（例如 NicetOS 自己的 Ollama）不檢查，直接放行。
+	if isLoopbackHost(host) {
+		if isConnect {
+			tunnelConnect(response, request)
+		} else {
+			handleBasicHTTP(response, request)
+		}
+		return
+	}
+
+	target := request.URL.String()
+	if isConnect {
+		target = "https://" + request.Host
+	}
+	log.Printf("[PROXY] Checking: %s", target)
+	allowed, reason, checkErr := checkWithReason(checker, target)
+	if checkErr != nil {
+		log.Printf("[PROXY] Check error for %s: %v (blocking)", target, checkErr)
+		allowed = false
+		if strings.TrimSpace(reason) == "" {
+			reason = fmt.Sprintf("NicetOS 無法完成判斷（%v），依安全規則封鎖。", checkErr)
+		}
+	}
+	if !allowed {
+		log.Printf("[PROXY] BLOCKED: %s; reason=%q", target, reason)
+		if isConnect {
+			handleBlockedConnect(response, request, checker, ca, reason)
+			return
+		}
+		serveBlockedPage(response, checker, reason)
+		return
+	}
+	log.Printf("[PROXY] ALLOWED: %s", target)
+	if isConnect {
+		tunnelConnect(response, request)
+		return
+	}
+	handleBasicHTTP(response, request)
+}
+
+func isLoopbackHost(hostport string) bool {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = hostport
+	}
+	host = strings.Trim(strings.TrimSuffix(strings.ToLower(host), "."), "[]")
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (proxy *TransparentProxy) Serve() error {
@@ -87,7 +110,15 @@ func (proxy *TransparentProxy) Serve() error {
 	return net.ErrClosed
 }
 
+// Close 可以安全地重複呼叫（Ctrl+C 和程式結束時都會呼叫一次）。
 func (proxy *TransparentProxy) Close() error {
+	proxy.closeOnce.Do(func() {
+		proxy.closeErr = proxy.closeNow()
+	})
+	return proxy.closeErr
+}
+
+func (proxy *TransparentProxy) closeNow() error {
 	log.Println("[PROXY] Closing proxy server")
 	err := proxy.server.Close()
 	if err != nil {
@@ -176,24 +207,44 @@ func serveBlockedPage(response http.ResponseWriter, checker URLChecker, reason s
 	_, _ = response.Write(body)
 }
 
-func checkWithReason(checker URLChecker, target string) (bool, string, error) {
-	if detailed, ok := checker.(interface {
-		CheckWithReason(string) (bool, string, error)
-	}); ok {
-		return detailed.CheckWithReason(target)
+// upstreamTransport 轉送一般 HTTP 請求；不讀系統 Proxy，避免繞回 NicetOS 自己。
+var upstreamTransport = &http.Transport{
+	Proxy:                 nil,
+	DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+	MaxIdleConns:          100,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ResponseHeaderTimeout: 60 * time.Second,
+}
+
+// 只在兩端之間有效、不應轉送的標頭。
+var hopByHopHeaders = []string{
+	"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate",
+	"Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade",
+}
+
+func removeHopByHopHeaders(header http.Header) {
+	for _, value := range header.Values("Connection") {
+		for _, name := range strings.Split(value, ",") {
+			header.Del(strings.TrimSpace(name))
+		}
 	}
-	allowed, err := checker.Check(target)
-	return allowed, "", err
+	for _, name := range hopByHopHeaders {
+		header.Del(name)
+	}
 }
 
 func handleBasicHTTP(response http.ResponseWriter, request *http.Request) {
-	request.RequestURI = ""
-	upstream, err := (&http.Transport{}).RoundTrip(request)
+	outgoing := request.Clone(request.Context())
+	outgoing.RequestURI = ""
+	removeHopByHopHeaders(outgoing.Header)
+	upstream, err := upstreamTransport.RoundTrip(outgoing)
 	if err != nil {
 		http.Error(response, "upstream request failed", http.StatusBadGateway)
 		return
 	}
 	defer upstream.Body.Close()
+	removeHopByHopHeaders(upstream.Header)
 	for key, values := range upstream.Header {
 		for _, value := range values {
 			response.Header().Add(key, value)
@@ -203,22 +254,23 @@ func handleBasicHTTP(response http.ResponseWriter, request *http.Request) {
 	_, _ = io.Copy(response, upstream.Body)
 }
 
+// handleBasicConnect 先檢查再建立 HTTPS 通道；無法判斷或出錯時封鎖。
 func handleBasicConnect(response http.ResponseWriter, request *http.Request, checker URLChecker) {
 	target := "https://" + request.Host
 	allowed, reason, err := checkWithReason(checker, target)
-	if err != nil {
-		if errors.Is(err, ErrUnknownDecision) {
-			log.Printf("[PROXY] Unknown decision for CONNECT %s; allowing through", target)
-			// fall through to connect upstream
-		} else {
-			serveBlockedPage(response, checker, reason)
-			return
+	if err != nil || !allowed {
+		if err != nil && strings.TrimSpace(reason) == "" {
+			reason = fmt.Sprintf("NicetOS 無法完成判斷（%v），依安全規則封鎖。", err)
 		}
-	} else if !allowed {
 		serveBlockedPage(response, checker, reason)
 		return
 	}
-	upstream, err := net.Dial("tcp", request.Host)
+	tunnelConnect(response, request)
+}
+
+// tunnelConnect 建立 HTTPS 通道，不再重複檢查網址。
+func tunnelConnect(response http.ResponseWriter, request *http.Request) {
+	upstream, err := net.DialTimeout("tcp", request.Host, 10*time.Second)
 	if err != nil {
 		http.Error(response, "upstream connection failed", http.StatusBadGateway)
 		return
@@ -234,11 +286,14 @@ func handleBasicConnect(response http.ResponseWriter, request *http.Request, che
 		return
 	}
 	defer client.Close()
-	_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	if buffered.Reader.Buffered() > 0 {
-		go io.Copy(upstream, buffered)
-	} else {
-		go io.Copy(upstream, client)
+	if _, err := client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		return
 	}
+	go func() {
+		_, _ = io.Copy(upstream, buffered.Reader)
+		if tcp, ok := upstream.(*net.TCPConn); ok {
+			_ = tcp.CloseWrite()
+		}
+	}()
 	_, _ = io.Copy(client, upstream)
 }

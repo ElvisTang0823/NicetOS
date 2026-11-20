@@ -60,7 +60,31 @@ type siteChecker struct {
 	client    *http.Client
 	lists     atomic.Pointer[domainLists]
 	updateMu  sync.Mutex
+
+	// Gemma4 判斷結果的快取：瀏覽器開一個網頁會對同一個網域開很多條連線，
+	// 沒有快取的話每條連線都會重新呼叫一次 Python 和 Gemma4。
+	aiMu       sync.Mutex
+	aiCache    map[string]aiDecision
+	aiInflight map[string]*aiCall
 }
+
+type aiDecision struct {
+	allowed bool
+	reason  string
+	expires time.Time
+}
+
+// aiCall 讓同一個網域同時進來的多個檢查只呼叫一次 Gemma4，其他的等結果。
+type aiCall struct {
+	done    chan struct{}
+	allowed bool
+	reason  string
+}
+
+const (
+	aiDecisionTTL = 10 * time.Minute // Gemma4 有明確結果時保留 10 分鐘
+	aiFailureTTL  = 30 * time.Second // 判斷失敗只保留 30 秒，Ollama 恢復後很快會重試
+)
 
 func (checker *siteChecker) BlockedPagePath() string {
 	return filepath.Join(checker.root, "assets", "index.html")
@@ -71,6 +95,9 @@ func newSiteChecker(root string) *siteChecker {
 		root:   root,
 		urls:   listURLs,
 		client: &http.Client{Timeout: 10 * time.Second},
+
+		aiCache:    map[string]aiDecision{},
+		aiInflight: map[string]*aiCall{},
 	}
 	checker.lists.Store(&domainLists{blacklist: map[string][]string{}, whitelist: map[string][]string{}})
 	return checker
@@ -156,7 +183,8 @@ func pythonCheckURL(root string, target string, ollamaAPI string) (bool, error) 
 		if ctx.Err() == context.DeadlineExceeded {
 			return false, proxy.ErrUnknownDecision
 		}
-		return true, err
+		// Python 執行失敗時不能放行，依安全規則視為封鎖。
+		return false, err
 	}
 	result := strings.TrimSpace(string(output))
 	switch result {
@@ -266,19 +294,68 @@ func (checker *siteChecker) CheckWithReason(target string) (bool, string, error)
 			return true, "", nil
 		}
 	}
+	allowed, reason := checker.aiCheck(domain, target)
+	return allowed, reason, nil
+}
+
+// aiCheck 先查快取；沒有快取就呼叫 Gemma4，同一網域同時只呼叫一次。
+func (checker *siteChecker) aiCheck(domain string, target string) (bool, string) {
+	checker.aiMu.Lock()
+	if checker.aiCache == nil {
+		checker.aiCache = map[string]aiDecision{}
+		checker.aiInflight = map[string]*aiCall{}
+	}
+	if cached, ok := checker.aiCache[domain]; ok && time.Now().Before(cached.expires) {
+		checker.aiMu.Unlock()
+		return cached.allowed, cached.reason
+	}
+	if call, ok := checker.aiInflight[domain]; ok {
+		checker.aiMu.Unlock()
+		<-call.done
+		return call.allowed, call.reason
+	}
+	call := &aiCall{done: make(chan struct{})}
+	checker.aiInflight[domain] = call
+	checker.aiMu.Unlock()
+
+	allowed, reason, definite := checker.askGemma(domain, target)
+	ttl := aiFailureTTL
+	if definite {
+		ttl = aiDecisionTTL
+	}
+
+	checker.aiMu.Lock()
+	// 順手清掉過期的快取，避免一直長大。
+	now := time.Now()
+	for key, value := range checker.aiCache {
+		if now.After(value.expires) {
+			delete(checker.aiCache, key)
+		}
+	}
+	checker.aiCache[domain] = aiDecision{allowed: allowed, reason: reason, expires: now.Add(ttl)}
+	delete(checker.aiInflight, domain)
+	checker.aiMu.Unlock()
+
+	call.allowed, call.reason = allowed, reason
+	close(call.done)
+	return allowed, reason
+}
+
+// askGemma 呼叫 Python/Gemma4；definite 表示 Gemma4 有給出明確的允許或封鎖。
+func (checker *siteChecker) askGemma(domain string, target string) (allowed bool, reason string, definite bool) {
 	log.Printf("[網址判斷] %s 未命中本機名單；正在呼叫 Gemma4", domain)
 	details, err := pythonCheckURLWithDetails(checker.root, target, checker.ollamaAPI)
 	if err != nil {
 		if errors.Is(err, proxy.ErrUnknownDecision) {
-			reason := strings.TrimSpace(details.Reason)
+			reason = strings.TrimSpace(details.Reason)
 			if reason == "" {
 				reason = err.Error()
 			}
 			log.Printf("[網址判斷] %s 未取得 Gemma4 明確結果；原因=%q；依安全規則封鎖", domain, reason)
-			return false, "Gemma4 無法提供明確判斷。原因：" + reason + " 依安全規則封鎖非白名單網址。", nil
+			return false, "Gemma4 無法提供明確判斷。原因：" + reason + " 依安全規則封鎖非白名單網址。", false
 		}
 		log.Printf("[網址判斷] %s 呼叫 Gemma4 失敗：%v；依安全規則封鎖", domain, err)
-		return false, fmt.Sprintf("Gemma4 判斷失敗（%v），依安全規則封鎖非白名單網址。", err), nil
+		return false, fmt.Sprintf("Gemma4 判斷失敗（%v），依安全規則封鎖非白名單網址。", err), false
 	}
 	log.Printf("[Gemma4 判斷結果] 網域=%s 決策=%s 分類=%q 信心度=%.0f%% 理由=%q",
 		domain,
@@ -287,12 +364,12 @@ func (checker *siteChecker) CheckWithReason(target string) (bool, string, error)
 		details.Confidence*100,
 		strings.ReplaceAll(details.Reason, "\n", " "),
 	)
-	reason := fmt.Sprintf("判斷來源：%s\n分類：%s\n信心度：%.0f%%\n判斷原因：%s",
+	reason = fmt.Sprintf("判斷來源：%s\n分類：%s\n信心度：%.0f%%\n判斷原因：%s",
 		details.Source, details.Category, details.Confidence*100, details.Reason)
 	if details.Decision == "BLOCK" {
-		return false, reason, nil
+		return false, reason, true
 	}
-	return true, reason, nil
+	return true, reason, true
 }
 
 func extractDomain(target string) string {
@@ -481,11 +558,6 @@ func main() {
 		log.Fatalf("Failed to determine proxy root: %v", err)
 	}
 	log.Printf("Proxy root directory: %s", root)
-	if err := ensureBundledPythonAssets(root); err != nil {
-		log.Printf("[PYTHON] 內嵌套件修復失敗：%v；Gemma4 將無法使用", err)
-	} else {
-		log.Printf("[PYTHON] Requests 與 Beautiful Soup 套件檢查／修復完成")
-	}
 	checker := newSiteChecker(root)
 	if err := checker.loadListsFromDisk(); err != nil {
 		log.Fatalf("Failed to load domain lists: %v", err)
@@ -493,6 +565,14 @@ func main() {
 	listRefreshStop := make(chan struct{})
 	checker.startListRefresh(listRefreshStop)
 	defer close(listRefreshStop)
+
+	// 先用程式內附的套件檔案修復（不需網路）；還是不能用，再用 pip 重新安裝。
+	if err := ensureBundledPythonAssets(root); err != nil {
+		log.Printf("[PYTHON] 內嵌套件修復失敗：%v；改用 pip 嘗試", err)
+	}
+	if err := ensurePythonPackages(root); err != nil {
+		log.Printf("[PYTHON] 套件無法使用：%v；Gemma4 判斷會失敗，非白名單網址將依安全規則封鎖", err)
+	}
 
 	ollama, err := startBundledOllama(root)
 	if err != nil {

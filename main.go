@@ -185,8 +185,8 @@ func pythonCheckURLWithDetails(root string, target string, ollamaAPI string) (de
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, python, args...)
-	command.Env = append(replaceEnvironment(os.Environ(), "PYTHONPATH", "NICETOS_OLLAMA_API"),
-		"PYTHONPATH="+root, "NICETOS_OLLAMA_API="+ollamaAPI)
+	command.Env = append(replaceEnvironment(os.Environ(), "PYTHONPATH", "NICETOS_OLLAMA_API", "PYTHONIOENCODING"),
+		"PYTHONPATH="+root, "NICETOS_OLLAMA_API="+ollamaAPI, "PYTHONIOENCODING=utf-8")
 	var stderr bytes.Buffer
 	command.Stderr = &stderr
 	output, err := command.Output()
@@ -195,7 +195,7 @@ func pythonCheckURLWithDetails(root string, target string, ollamaAPI string) (de
 	}
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			return decisionDetails{}, proxy.ErrUnknownDecision
+			return decisionDetails{}, fmt.Errorf("%w: Python/Gemma4 判斷逾時（60 秒）", proxy.ErrUnknownDecision)
 		}
 		return decisionDetails{}, err
 	}
@@ -204,7 +204,7 @@ func pythonCheckURLWithDetails(root string, target string, ollamaAPI string) (de
 		return decisionDetails{}, fmt.Errorf("decode Python decision: %w", err)
 	}
 	if details.Decision != "ALLOW" && details.Decision != "BLOCK" {
-		return details, proxy.ErrUnknownDecision
+		return details, fmt.Errorf("%w：Python 回傳 decision=%q", proxy.ErrUnknownDecision, details.Decision)
 	}
 	return details, nil
 }
@@ -270,8 +270,12 @@ func (checker *siteChecker) CheckWithReason(target string) (bool, string, error)
 	details, err := pythonCheckURLWithDetails(checker.root, target, checker.ollamaAPI)
 	if err != nil {
 		if errors.Is(err, proxy.ErrUnknownDecision) {
-			log.Printf("[網址判斷] %s 未取得 Gemma4 明確結果；依安全規則封鎖", domain)
-			return false, "Gemma4 無法提供明確判斷，依安全規則封鎖非白名單網址。", nil
+			reason := strings.TrimSpace(details.Reason)
+			if reason == "" {
+				reason = err.Error()
+			}
+			log.Printf("[網址判斷] %s 未取得 Gemma4 明確結果；原因=%q；依安全規則封鎖", domain, reason)
+			return false, "Gemma4 無法提供明確判斷。原因：" + reason + " 依安全規則封鎖非白名單網址。", nil
 		}
 		log.Printf("[網址判斷] %s 呼叫 Gemma4 失敗：%v；依安全規則封鎖", domain, err)
 		return false, fmt.Sprintf("Gemma4 判斷失敗（%v），依安全規則封鎖非白名單網址。", err), nil

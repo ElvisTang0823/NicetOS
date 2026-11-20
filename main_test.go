@@ -108,6 +108,27 @@ func TestGemmaBlockReasonIsPassedToBlockedPage(t *testing.T) {
 	}
 }
 
+func TestUnknownGemmaReasonIsPassedToBlockedPage(t *testing.T) {
+	root := t.TempDir()
+	scriptPath := filepath.Join(root, "main.py")
+	script := `def check_url_with_details(url): return {"decision":"UNKNOWN","category":"AI 模組不可用","confidence":0,"reason":"requests_loader 無法載入","source":"NicetOS"}`
+	if err := os.WriteFile(scriptPath, []byte(script+"\n"), 0644); err != nil {
+		t.Fatalf("write test script: %v", err)
+	}
+
+	checker := newSiteChecker(root)
+	allowed, reason, err := checker.CheckWithReason("https://example.com")
+	if err != nil {
+		t.Fatalf("check URL: %v", err)
+	}
+	if allowed {
+		t.Fatal("expected unknown Gemma4 decision to remain blocked")
+	}
+	if !strings.Contains(reason, "requests_loader 無法載入") {
+		t.Fatalf("expected blocked reason to include the underlying Gemma4 failure, got %q", reason)
+	}
+}
+
 func TestUnknownDomainIsBlockedWhenPythonFails(t *testing.T) {
 	root := t.TempDir()
 	scriptPath := filepath.Join(root, "main.py")

@@ -63,7 +63,7 @@ func StartTransparentProxy(address string, checker URLChecker) (*TransparentProx
 			return
 		}
 		if !allowed {
-			log.Printf("[PROXY] BLOCKED: %s (blacklist)", target)
+			log.Printf("[PROXY] BLOCKED: %s; reason=%q", target, reason)
 			if request.Method == http.MethodConnect {
 				handleBlockedConnect(response, request, checker, ca, reason)
 				return

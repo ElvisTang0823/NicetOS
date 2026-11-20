@@ -30,6 +30,13 @@ try:
 except ImportError:  # pragma: no cover - optional dependency for AI fallback
     BeautifulSoup = None
 
+if requests is not None:
+    # Avoid routing AI-internal traffic back through NicetOS's own proxy.
+    requests_session = requests.Session()
+    requests_session.trust_env = False
+else:
+    requests_session = None
+
 HASH_CAPACITY = 142867
 OLLAMA_API = os.environ.get("NICETOS_OLLAMA_API", "").rstrip("/") + "/api/chat"
 MODEL_NAME = "gemma4-child-safety"
@@ -156,7 +163,7 @@ def fetch_webpage_info(url: str):
     }
 
     try:
-        response = requests.get(url, headers=headers, timeout=15)
+        response = requests_session.get(url, headers=headers, timeout=(3, 5))
         response.encoding = response.apparent_encoding or "utf-8"
         response.raise_for_status()
 
@@ -173,7 +180,8 @@ def fetch_webpage_info(url: str):
         if not full_content:
             full_content = "無網頁內容說明"
         return title, full_content
-    except Exception:
+    except Exception as exc:
+        print(f"Page content fetch failed; using URL-only context ({type(exc).__name__}).", file=sys.stderr)
         return None, None
 
 
@@ -186,6 +194,7 @@ def check_url_safety(url: str):
         print("Gemma4 request skipped: local Ollama API URL is not configured.", file=sys.stderr)
         return None
 
+    print("Gemma4 internal HTTP requests bypass the system proxy to prevent self-interception.", file=sys.stderr)
     title, content = fetch_webpage_info(url)
     if not title:
         title = "無法取得網頁標題"
@@ -222,7 +231,7 @@ def check_url_safety(url: str):
     }
 
     try:
-        response = requests.post(OLLAMA_API, json=payload, timeout=30)
+        response = requests_session.post(OLLAMA_API, json=payload, timeout=30)
         response.raise_for_status()
         result = response.json()
 

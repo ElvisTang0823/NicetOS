@@ -481,6 +481,11 @@ func main() {
 		log.Fatalf("Failed to determine proxy root: %v", err)
 	}
 	log.Printf("Proxy root directory: %s", root)
+	if err := ensureBundledPythonAssets(root); err != nil {
+		log.Printf("[PYTHON] 內嵌套件修復失敗：%v；Gemma4 將無法使用", err)
+	} else {
+		log.Printf("[PYTHON] Requests 與 Beautiful Soup 套件檢查／修復完成")
+	}
 	checker := newSiteChecker(root)
 	if err := checker.loadListsFromDisk(); err != nil {
 		log.Fatalf("Failed to load domain lists: %v", err)

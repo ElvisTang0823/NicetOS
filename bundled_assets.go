@@ -61,3 +61,36 @@ func verifyBundledPythonAssets(root string) error {
 	}
 	return nil
 }
+
+func writeBundledPythonRuntime(root string) error {
+	return fs.WalkDir(bundledAssets, "python_runtime", func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		contents, err := bundledAssets.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(root, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			return err
+		}
+		return os.WriteFile(target, contents, 0644)
+	})
+}
+
+func ensureBundledPythonAssets(root string) error {
+	if err := verifyBundledPythonAssets(root); err == nil {
+		return nil
+	}
+	if err := writeBundledPythonRuntime(root); err != nil {
+		return fmt.Errorf("repair embedded Python runtime: %w", err)
+	}
+	if err := verifyBundledPythonAssets(root); err != nil {
+		return fmt.Errorf("verify repaired Python packages: %w", err)
+	}
+	return nil
+}

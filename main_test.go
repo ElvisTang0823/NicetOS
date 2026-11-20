@@ -76,6 +76,12 @@ func TestBundledPythonIncludesRequestsPackageFiles(t *testing.T) {
 	if err := verifyBundledPythonAssets(root); err == nil {
 		t.Fatal("expected verification to fail when the Requests entry point is missing")
 	}
+	if err := ensureBundledPythonAssets(root); err != nil {
+		t.Fatalf("repair missing embedded Python packages: %v", err)
+	}
+	if err := verifyBundledPythonAssets(root); err != nil {
+		t.Fatalf("verify repaired Python packages: %v", err)
+	}
 }
 
 func TestPythonScriptArgsPreserveLauncherArguments(t *testing.T) {

@@ -256,26 +256,33 @@ func (checker *siteChecker) CheckWithReason(target string) (bool, string, error)
 	key := domainHashKey(domain)
 	for _, blocked := range lists.blacklist[key] {
 		if blocked == domain {
-			log.Printf("[CHECK] %s matched local blacklist; skipping Ollama", domain)
+			log.Printf("[網址判斷] %s 命中本機黑名單；未呼叫 Gemma4", domain)
 			return false, fmt.Sprintf("分類：黑名單\n判斷依據：%s 命中 NicetOS 黑名單。", domain), nil
 		}
 	}
 	for _, allowed := range lists.whitelist[key] {
 		if allowed == domain {
-			log.Printf("[CHECK] %s matched local whitelist; skipping Ollama", domain)
+			log.Printf("[網址判斷] %s 命中本機白名單；未呼叫 Gemma4", domain)
 			return true, "", nil
 		}
 	}
-	log.Printf("[CHECK] %s did not match local lists; requesting Gemma4", domain)
+	log.Printf("[網址判斷] %s 未命中本機名單；正在呼叫 Gemma4", domain)
 	details, err := pythonCheckURLWithDetails(checker.root, target, checker.ollamaAPI)
 	if err != nil {
 		if errors.Is(err, proxy.ErrUnknownDecision) {
-			log.Printf("[CHECK] unknown decision for %s; blocking because no safe decision is available", domain)
+			log.Printf("[網址判斷] %s 未取得 Gemma4 明確結果；依安全規則封鎖", domain)
 			return false, "Gemma4 無法提供明確判斷，依安全規則封鎖非白名單網址。", nil
 		}
-		log.Printf("[CHECK] decision failed for %s; blocking: %v", domain, err)
+		log.Printf("[網址判斷] %s 呼叫 Gemma4 失敗：%v；依安全規則封鎖", domain, err)
 		return false, fmt.Sprintf("Gemma4 判斷失敗（%v），依安全規則封鎖非白名單網址。", err), nil
 	}
+	log.Printf("[Gemma4 判斷結果] 網域=%s 決策=%s 分類=%q 信心度=%.0f%% 理由=%q",
+		domain,
+		details.Decision,
+		strings.ReplaceAll(details.Category, "\n", " "),
+		details.Confidence*100,
+		strings.ReplaceAll(details.Reason, "\n", " "),
+	)
 	reason := fmt.Sprintf("判斷來源：%s\n分類：%s\n信心度：%.0f%%\n判斷原因：%s",
 		details.Source, details.Category, details.Confidence*100, details.Reason)
 	if details.Decision == "BLOCK" {
@@ -480,7 +487,7 @@ func main() {
 
 	ollama, err := startBundledOllama(root)
 	if err != nil {
-		log.Printf("[OLLAMA] compatibility check FAILED: %v; local AI unavailable and non-whitelisted domains will be blocked", err)
+		log.Printf("[OLLAMA] 支援測試：失敗；原因：%v；Gemma4 無法使用，非白名單網址將依安全規則封鎖", err)
 	} else {
 		defer func() {
 			if closeErr := ollama.Close(); closeErr != nil {

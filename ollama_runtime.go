@@ -28,48 +28,48 @@ type bundledOllama struct {
 }
 
 func startBundledOllama(root string) (*bundledOllama, error) {
-	log.Println("[OLLAMA] compatibility check: validating the bundled Windows runtime and model files")
+	log.Println("[OLLAMA] 支援測試開始：檢查隨附執行檔、模型並實際執行推論")
 	binDir := filepath.Join(root, "ollama", "bin")
 	executable := filepath.Join(binDir, "ollama.exe")
 	if info, err := os.Stat(executable); err != nil {
-		return nil, fmt.Errorf("project-local executable not found at %s: %w", executable, err)
+		return nil, fmt.Errorf("找不到隨附的 Ollama 執行檔（%s）：%w", executable, err)
 	} else if info.IsDir() {
-		return nil, fmt.Errorf("project-local executable path is a directory: %s", executable)
+		return nil, fmt.Errorf("Ollama 執行檔路徑不是檔案：%s", executable)
 	}
-	log.Println("[OLLAMA] bundled executable found")
+	log.Println("[OLLAMA] 執行檔檢查：通過")
 
 	sourceDir := filepath.Join(root, "ollama", "models")
 	modelfile := filepath.Join(sourceDir, "Modelfile")
 	modelFile := filepath.Join(sourceDir, "gemma4_child_safety_q4.gguf")
 	for _, path := range []string{modelfile, modelFile} {
 		if _, err := os.Stat(path); err != nil {
-			return nil, fmt.Errorf("required model source file %s: %w", path, err)
+			return nil, fmt.Errorf("找不到必要的 Gemma4 模型檔案（%s）：%w", path, err)
 		}
 	}
-	log.Println("[OLLAMA] bundled model files found; CPU inference is supported when GPU acceleration is unavailable")
+	log.Println("[OLLAMA] 模型檔檢查：通過；若沒有可用 GPU，Ollama 會嘗試使用 CPU")
 
 	modelStore := filepath.Join(root, "ollama", "runtime-models")
 	if err := os.MkdirAll(modelStore, 0755); err != nil {
-		return nil, fmt.Errorf("create project-local model store: %w", err)
+		return nil, fmt.Errorf("無法建立 Ollama 模型資料夾：%w", err)
 	}
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return nil, fmt.Errorf("select local API port: %w", err)
+		return nil, fmt.Errorf("無法配置 Ollama 本機 API 連接埠：%w", err)
 	}
 	address := listener.Addr().String()
 	if err := listener.Close(); err != nil {
-		return nil, fmt.Errorf("release local API port: %w", err)
+		return nil, fmt.Errorf("無法釋放 Ollama 本機 API 連接埠：%w", err)
 	}
 
 	apiURL := "http://" + address
-	log.Println("[OLLAMA] starting local runtime to verify computer compatibility")
+	log.Println("[OLLAMA] 正在啟動本機服務並檢查 API")
 	server := exec.Command(executable, "serve")
 	server.Env = ollamaEnvironment(os.Environ(), address, modelStore)
 	server.Stdout = os.Stderr
 	server.Stderr = os.Stderr
 	if err := server.Start(); err != nil {
-		return nil, fmt.Errorf("start project-local Ollama: %w", err)
+		return nil, fmt.Errorf("無法啟動隨附的 Ollama 服務：%w", err)
 	}
 	runtime := &bundledOllama{
 		apiURL:  apiURL,
@@ -83,19 +83,19 @@ func startBundledOllama(root string) (*bundledOllama, error) {
 
 	if err := runtime.waitUntilReady(45 * time.Second); err != nil {
 		_ = runtime.Close()
-		return nil, err
+		return nil, fmt.Errorf("Ollama API 未能在 45 秒內啟動：%w", err)
 	}
-	log.Println("[OLLAMA] local API is responding")
+	log.Println("[OLLAMA] API 檢查：通過")
 	if err := runtime.ensureModel(executable, sourceDir, modelfile, modelStore); err != nil {
 		_ = runtime.Close()
-		return nil, err
+		return nil, fmt.Errorf("Gemma4 模型準備失敗：%w", err)
 	}
-	log.Println("[OLLAMA] testing Gemma4 inference on this computer; first model load may take several minutes")
+	log.Println("[OLLAMA] Gemma4 實際推論測試中；首次載入可能需要數分鐘，最長等待 5 分鐘")
 	if err := runtime.checkModelInference(); err != nil {
 		_ = runtime.Close()
-		return nil, fmt.Errorf("Gemma4 inference compatibility check failed: %w", err)
+		return nil, fmt.Errorf("Gemma4 實際推論測試失敗：%w", err)
 	}
-	log.Println("[OLLAMA] compatibility check passed: bundled runtime and Gemma4 inference are usable")
+	log.Println("[OLLAMA] 支援測試：通過；此電腦可執行隨附 Ollama 與 Gemma4 推論")
 	return runtime, nil
 }
 
@@ -145,13 +145,14 @@ func (runtime *bundledOllama) waitUntilReady(timeout time.Duration) error {
 func (runtime *bundledOllama) ensureModel(executable string, sourceDir string, modelfile string, modelStore string) error {
 	found, err := runtime.hasModel()
 	if err != nil {
-		return fmt.Errorf("check project-local model registry: %w", err)
+		return fmt.Errorf("無法讀取 Ollama 模型清單：%w", err)
 	}
 	if found {
+		log.Printf("[OLLAMA] 模型檢查：%s 已註冊", bundledModelName)
 		return nil
 	}
 
-	log.Printf("[OLLAMA] importing the bundled GGUF model; first startup may take several minutes")
+	log.Printf("[OLLAMA] 模型尚未註冊，正在匯入隨附 GGUF；首次啟動可能需要數分鐘")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 	create := exec.CommandContext(ctx, executable, "create", bundledModelName, "-f", modelfile)
@@ -162,17 +163,17 @@ func (runtime *bundledOllama) ensureModel(executable string, sourceDir string, m
 	err = create.Run()
 	if err != nil {
 		if ctx.Err() != nil {
-			return fmt.Errorf("register local model: %w", ctx.Err())
+			return fmt.Errorf("註冊 Gemma4 模型逾時：%w", ctx.Err())
 		}
-		return fmt.Errorf("register local model: %w", err)
+		return fmt.Errorf("註冊 Gemma4 模型失敗：%w", err)
 	}
 
 	found, err = runtime.hasModel()
 	if err != nil {
-		return fmt.Errorf("verify registered model: %w", err)
+		return fmt.Errorf("無法確認 Gemma4 模型是否註冊：%w", err)
 	}
 	if !found {
-		return fmt.Errorf("Ollama create completed but model %q is not listed", bundledModelName)
+		return fmt.Errorf("Ollama 完成註冊，但模型清單中找不到 %q", bundledModelName)
 	}
 	return nil
 }
@@ -223,23 +224,23 @@ func (runtime *bundledOllama) checkModelInference() error {
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("encode inference check request: %w", err)
+		return fmt.Errorf("建立推論測試內容失敗：%w", err)
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, runtime.apiURL+"/api/chat", strings.NewReader(string(body)))
 	if err != nil {
-		return fmt.Errorf("create inference check request: %w", err)
+		return fmt.Errorf("建立推論測試請求失敗：%w", err)
 	}
 	request.Header.Set("Content-Type", "application/json")
 	response, err := (&http.Client{Timeout: ollamaInferenceCheckTimeout}).Do(request)
 	if err != nil {
 		if ctx.Err() != nil {
-			return fmt.Errorf("inference check timed out after %s: %w", ollamaInferenceCheckTimeout, ctx.Err())
+			return fmt.Errorf("等待 Gemma4 推論超過 %s：%w", ollamaInferenceCheckTimeout, ctx.Err())
 		}
-		return fmt.Errorf("send inference check request: %w", err)
+		return fmt.Errorf("無法呼叫 Ollama 推論 API：%w", err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("inference check returned %s", response.Status)
+		return fmt.Errorf("Ollama 推論 API 回應錯誤：%s", response.Status)
 	}
 	var result struct {
 		Message struct {
@@ -247,10 +248,10 @@ func (runtime *bundledOllama) checkModelInference() error {
 		} `json:"message"`
 	}
 	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
-		return fmt.Errorf("decode inference check response: %w", err)
+		return fmt.Errorf("無法讀取 Ollama 推論結果：%w", err)
 	}
 	if strings.TrimSpace(result.Message.Content) == "" {
-		return errors.New("inference check returned an empty response")
+		return errors.New("Ollama 推論成功回應，但 Gemma4 沒有回傳內容")
 	}
 	return nil
 }

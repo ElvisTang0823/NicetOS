@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -30,7 +31,11 @@ type bundledOllama struct {
 func startBundledOllama(root string) (*bundledOllama, error) {
 	log.Println("[OLLAMA] 支援測試開始：檢查隨附執行檔、模型並實際執行推論")
 	binDir := filepath.Join(root, "ollama", "bin")
-	executable := filepath.Join(binDir, "ollama.exe")
+	executableName := "ollama"
+	if runtime.GOOS == "windows" {
+		executableName = "ollama.exe"
+	}
+	executable := filepath.Join(binDir, executableName)
 	if info, err := os.Stat(executable); err != nil {
 		return nil, fmt.Errorf("找不到隨附的 Ollama 執行檔（%s）：%w", executable, err)
 	} else if info.IsDir() {

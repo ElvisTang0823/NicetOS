@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-//go:embed assets/index.html data/blacklist.json data/whitelist.json main.py python/get.py python/hash.py python/requests_loader.py python/requirements.txt python_runtime
+//go:embed assets/index.html data/blacklist.json data/whitelist.json main.py python/get.py python/hash.py python/requests_loader.py python/requirements.txt all:python_runtime
 var bundledAssets embed.FS
 
 func writeBundledAssets(root string) error {

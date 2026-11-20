@@ -39,6 +39,34 @@ func TestPythonExecutablePrefersBundledRuntime(t *testing.T) {
 	}
 }
 
+func TestBundledPythonIncludesRequestsPackageFiles(t *testing.T) {
+	paths := []string{
+		"python_runtime/Lib/site-packages/requests/__init__.py",
+		"python_runtime/Lib/site-packages/requests/_internal_utils.py",
+		"python_runtime/Lib/site-packages/bs4/__init__.py",
+	}
+	for _, path := range paths {
+		contents, err := bundledAssets.ReadFile(path)
+		if err != nil {
+			t.Errorf("embedded Python runtime is missing %s: %v", path, err)
+			continue
+		}
+		if len(contents) == 0 {
+			t.Errorf("embedded Python runtime file %s is empty", path)
+		}
+	}
+
+	root := t.TempDir()
+	if err := writeBundledAssets(root); err != nil {
+		t.Fatalf("extract embedded Python runtime: %v", err)
+	}
+	for _, path := range paths {
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(path))); err != nil {
+			t.Errorf("extracted Python runtime is missing %s: %v", path, err)
+		}
+	}
+}
+
 func TestPythonScriptArgsPreserveLauncherArguments(t *testing.T) {
 	args := pythonScriptArgs([]string{"-3"}, "C:\\NicetOS\\python\\get.py")
 	expected := []string{"-3", "C:\\NicetOS\\python\\get.py"}

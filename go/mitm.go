@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -10,14 +12,27 @@ import (
 	"encoding/pem"
 	"fmt"
 	"html"
+	"io"
+	"log"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 )
+
+const maxPageInspectionBytes = 1 << 20
+
+type pageContentChecker interface {
+	CheckWithContent(string, string, []byte) (bool, string, error)
+}
+
+type knownURLChecker interface {
+	CheckKnown(string) (bool, bool, string)
+}
 
 // certificateAuthority signs certificates for the local HTTPS filtering page.
 type certificateAuthority struct {
@@ -213,4 +228,176 @@ func readBlockedPageBody(checker URLChecker, reasons ...string) ([]byte, error) 
 	}
 	body = []byte(strings.ReplaceAll(string(body), "{{BLOCK_REASON}}", html.EscapeString(reason)))
 	return body, nil
+}
+
+func knownDecision(checker URLChecker, target string) (bool, bool, string) {
+	detailed, ok := checker.(knownURLChecker)
+	if !ok {
+		return false, false, ""
+	}
+	return detailed.CheckKnown(target)
+}
+
+func inspectAndWriteResponse(writer io.Writer, checker URLChecker, target string, response *http.Response) error {
+	upstreamBody := response.Body
+	defer upstreamBody.Close()
+	allowed, reason, err := inspectResponse(checker, target, response)
+	if err != nil {
+		log.Printf("[PROXY] content check failed for %s: %v", target, err)
+		allowed = false
+		reason = "NicetOS 無法完成網頁內容檢查，依安全規則封鎖。"
+	}
+	if !allowed {
+		writeBlockedHTTPResponse(writer, checker, reason)
+		return nil
+	}
+	return response.Write(writer)
+}
+
+func inspectResponse(checker URLChecker, target string, response *http.Response) (bool, string, error) {
+	known, allowed, reason := knownDecision(checker, target)
+	if !known {
+		pageContent, err := readPageContentForInspection(response)
+		if err != nil {
+			return false, "", fmt.Errorf("read upstream response for inspection: %w", err)
+		}
+		if detailed, ok := checker.(pageContentChecker); ok {
+			allowed, reason, err = detailed.CheckWithContent(target, response.Header.Get("Content-Type"), pageContent)
+		} else {
+			allowed, reason, err = checkWithReason(checker, target)
+		}
+		if err != nil {
+			return false, "", fmt.Errorf("check response content: %w", err)
+		}
+	}
+	return allowed, reason, nil
+}
+
+func readPageContentForInspection(response *http.Response) ([]byte, error) {
+	contentType := strings.ToLower(response.Header.Get("Content-Type"))
+	if !strings.Contains(contentType, "text/html") && !strings.Contains(contentType, "application/xhtml+xml") {
+		return nil, nil
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxPageInspectionBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxPageInspectionBytes {
+		response.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), response.Body))
+		return body[:maxPageInspectionBytes], nil
+	}
+	response.Body = io.NopCloser(bytes.NewReader(body))
+	response.ContentLength = int64(len(body))
+	return body, nil
+}
+
+func writeBlockedHTTPResponse(writer io.Writer, checker URLChecker, reason string) {
+	body, err := readBlockedPageBody(checker, reason)
+	if err != nil {
+		_, _ = io.WriteString(writer, "HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 24\r\n\r\naccess denied by NicetOS")
+		return
+	}
+	_, _ = fmt.Fprintf(writer, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+}
+
+func normalizedHostname(host string) (string, error) {
+	host = strings.TrimSpace(host)
+	if parsed, _, err := net.SplitHostPort(host); err == nil {
+		host = parsed
+	} else if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = strings.Trim(host, "[]")
+	} else if strings.Contains(host, ":") && net.ParseIP(host) == nil {
+		return "", fmt.Errorf("invalid host %q", host)
+	}
+	host = strings.TrimSuffix(strings.Trim(strings.ToLower(host), "[]"), ".")
+	if host == "" {
+		return "", fmt.Errorf("empty host")
+	}
+	return host, nil
+}
+
+func sameHostname(first string, second string) bool {
+	firstHost, firstErr := normalizedHostname(first)
+	secondHost, secondErr := normalizedHostname(second)
+	return firstErr == nil && secondErr == nil && firstHost == secondHost
+}
+
+func requestHostMatchesDestination(host string, original string) (bool, error) {
+	host, err := normalizedHostname(host)
+	if err != nil {
+		return false, err
+	}
+	destinationHost, _, err := net.SplitHostPort(original)
+	if err != nil {
+		return false, fmt.Errorf("parse original destination %q: %w", original, err)
+	}
+	destinationIP := net.ParseIP(destinationHost)
+	if destinationIP == nil {
+		return false, fmt.Errorf("original destination %q is not an IP address", destinationHost)
+	}
+	if hostIP := net.ParseIP(host); hostIP != nil {
+		return hostIP.Equal(destinationIP), nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	addresses, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return false, fmt.Errorf("resolve request host %q: %w", host, err)
+	}
+	for _, address := range addresses {
+		if address.IP.Equal(destinationIP) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func serveInspectedTLSConnection(connection net.Conn, reader *bufio.Reader, host string, checker URLChecker, ca *certificateAuthority, dialContext func(context.Context, string, string) (net.Conn, error)) error {
+	config, err := ca.tlsConfig(host)
+	if err != nil {
+		return err
+	}
+	tlsConnection := tls.Server(&readerConn{Conn: connection, reader: reader}, config)
+	if err := tlsConnection.Handshake(); err != nil {
+		return err
+	}
+	defer tlsConnection.Close()
+
+	request, err := http.ReadRequest(bufio.NewReader(tlsConnection))
+	if err != nil {
+		return err
+	}
+	requestHost := request.Host
+	if requestHost == "" {
+		requestHost = host
+	}
+	if !sameHostname(host, requestHost) {
+		writeBlockedHTTPResponse(tlsConnection, checker, "TLS SNI 與 HTTP Host 不一致，依安全規則封鎖。")
+		return nil
+	}
+	target := "https://" + requestHost + request.URL.RequestURI()
+	if known, allowed, reason := knownDecision(checker, target); known && !allowed {
+		writeBlockedHTTPResponse(tlsConnection, checker, reason)
+		return nil
+	}
+
+	request.RequestURI = ""
+	request.URL.Scheme = "https"
+	request.URL.Host = requestHost
+	request.Header.Del("Accept-Encoding")
+	request.Close = true
+	transport := &http.Transport{
+		DialContext:       dialContext,
+		ForceAttemptHTTP2: false,
+		DisableKeepAlives: true,
+	}
+	response, err := transport.RoundTrip(request)
+	if err != nil {
+		return fmt.Errorf("HTTPS upstream request failed: %w", err)
+	}
+	response.Close = true
+	if err := inspectAndWriteResponse(tlsConnection, checker, target, response); err != nil {
+		return fmt.Errorf("inspect HTTPS response: %w", err)
+	}
+	return nil
 }

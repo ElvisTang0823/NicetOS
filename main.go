@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -200,6 +201,10 @@ func pythonCheckURL(root string, target string, ollamaAPI string) (bool, error) 
 }
 
 func pythonCheckURLWithDetails(root string, target string, ollamaAPI string) (decisionDetails, error) {
+	return pythonCheckURLWithContent(root, target, ollamaAPI, nil)
+}
+
+func pythonCheckURLWithContent(root string, target string, ollamaAPI string, pageHTML []byte) (decisionDetails, error) {
 	scriptPath := filepath.Join(root, "main.py")
 	if _, err := os.Stat(scriptPath); err != nil {
 		return decisionDetails{}, err
@@ -208,11 +213,14 @@ func pythonCheckURLWithDetails(root string, target string, ollamaAPI string) (de
 	if python == "" {
 		return decisionDetails{}, errors.New("python interpreter not found")
 	}
-	script := "import json,sys; sys.path.insert(0,sys.argv[1]); import main; print(json.dumps(main.check_url_with_details(sys.argv[2]), ensure_ascii=False))"
+	script := "import json,sys; sys.path.insert(0,sys.argv[1]); import main; page_html=sys.stdin.buffer.read(); result=main.check_url_with_details(sys.argv[2], page_html) if page_html else main.check_url_with_details(sys.argv[2]); print(json.dumps(result, ensure_ascii=False))"
 	args := append(prefixArgs, "-c", script, root, target)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, python, args...)
+	if len(pageHTML) > 0 {
+		command.Stdin = bytes.NewReader(pageHTML)
+	}
 	command.Env = append(replaceEnvironment(os.Environ(), "PYTHONPATH", "NICETOS_OLLAMA_API", "PYTHONIOENCODING"),
 		"PYTHONPATH="+root, "NICETOS_OLLAMA_API="+ollamaAPI, "PYTHONIOENCODING=utf-8")
 	var stderr bytes.Buffer
@@ -271,54 +279,80 @@ func (checker *siteChecker) Check(target string) (bool, error) {
 }
 
 func (checker *siteChecker) CheckWithReason(target string) (bool, string, error) {
+	return checker.checkWithContent(target, nil)
+}
+
+func (checker *siteChecker) CheckWithContent(target string, contentType string, pageContent []byte) (bool, string, error) {
+	if !strings.Contains(strings.ToLower(contentType), "text/html") &&
+		!strings.Contains(strings.ToLower(contentType), "application/xhtml+xml") {
+		pageContent = nil
+	}
+	return checker.checkWithContent(target, pageContent)
+}
+
+func (checker *siteChecker) CheckKnown(target string) (bool, bool, string) {
 	domain := extractDomain(target)
 	if domain == "" {
 		log.Printf("[CHECK] could not determine the requested domain; blocking")
-		return false, "NicetOS 無法解析此網址，依安全規則封鎖。", nil
+		return true, false, "NicetOS 無法解析此網址，依安全規則封鎖。"
 	}
 	lists := checker.lists.Load()
 	if lists == nil {
 		log.Printf("[CHECK] domain lists are unavailable for %s; blocking", domain)
-		return false, "安全名單尚未載入，依安全規則封鎖。", nil
+		return true, false, "安全名單尚未載入，依安全規則封鎖。"
 	}
 	key := domainHashKey(domain)
 	for _, blocked := range lists.blacklist[key] {
 		if blocked == domain {
 			log.Printf("[網址判斷] %s 命中本機黑名單；未呼叫 Gemma4", domain)
-			return false, fmt.Sprintf("分類：黑名單\n判斷依據：%s 命中 NicetOS 黑名單。", domain), nil
+			return true, false, fmt.Sprintf("分類：黑名單\n判斷依據：%s 命中 NicetOS 黑名單。", domain)
 		}
 	}
 	for _, allowed := range lists.whitelist[key] {
 		if allowed == domain {
 			log.Printf("[網址判斷] %s 命中本機白名單；未呼叫 Gemma4", domain)
-			return true, "", nil
+			return true, true, ""
 		}
 	}
-	allowed, reason := checker.aiCheck(domain, target)
+	return false, false, ""
+}
+
+func (checker *siteChecker) checkWithContent(target string, pageContent []byte) (bool, string, error) {
+	if known, allowed, reason := checker.CheckKnown(target); known {
+		return allowed, reason, nil
+	}
+	domain := extractDomain(target)
+	if domain == "" {
+		return false, "NicetOS 無法解析此網址，依安全規則封鎖。", nil
+	}
+	allowed, reason := checker.aiCheck(domain, target, pageContent)
 	return allowed, reason, nil
 }
 
-// aiCheck 先查快取；沒有快取就呼叫 Gemma4，同一網域同時只呼叫一次。
-func (checker *siteChecker) aiCheck(domain string, target string) (bool, string) {
+func (checker *siteChecker) aiCheck(domain string, target string, pageContent []byte) (bool, string) {
+	cacheKey := domain
+	if len(pageContent) > 0 {
+		cacheKey = fmt.Sprintf("%s:%s:%x", domain, target, sha256.Sum256(pageContent))
+	}
 	checker.aiMu.Lock()
 	if checker.aiCache == nil {
 		checker.aiCache = map[string]aiDecision{}
 		checker.aiInflight = map[string]*aiCall{}
 	}
-	if cached, ok := checker.aiCache[domain]; ok && time.Now().Before(cached.expires) {
+	if cached, ok := checker.aiCache[cacheKey]; ok && time.Now().Before(cached.expires) {
 		checker.aiMu.Unlock()
 		return cached.allowed, cached.reason
 	}
-	if call, ok := checker.aiInflight[domain]; ok {
+	if call, ok := checker.aiInflight[cacheKey]; ok {
 		checker.aiMu.Unlock()
 		<-call.done
 		return call.allowed, call.reason
 	}
 	call := &aiCall{done: make(chan struct{})}
-	checker.aiInflight[domain] = call
+	checker.aiInflight[cacheKey] = call
 	checker.aiMu.Unlock()
 
-	allowed, reason, definite := checker.askGemma(domain, target)
+	allowed, reason, definite := checker.askGemma(domain, target, pageContent)
 	ttl := aiFailureTTL
 	if definite {
 		ttl = aiDecisionTTL
@@ -332,8 +366,8 @@ func (checker *siteChecker) aiCheck(domain string, target string) (bool, string)
 			delete(checker.aiCache, key)
 		}
 	}
-	checker.aiCache[domain] = aiDecision{allowed: allowed, reason: reason, expires: now.Add(ttl)}
-	delete(checker.aiInflight, domain)
+	checker.aiCache[cacheKey] = aiDecision{allowed: allowed, reason: reason, expires: now.Add(ttl)}
+	delete(checker.aiInflight, cacheKey)
 	checker.aiMu.Unlock()
 
 	call.allowed, call.reason = allowed, reason
@@ -341,10 +375,9 @@ func (checker *siteChecker) aiCheck(domain string, target string) (bool, string)
 	return allowed, reason
 }
 
-// askGemma 呼叫 Python/Gemma4；definite 表示 Gemma4 有給出明確的允許或封鎖。
-func (checker *siteChecker) askGemma(domain string, target string) (allowed bool, reason string, definite bool) {
+func (checker *siteChecker) askGemma(domain string, target string, pageContent []byte) (allowed bool, reason string, definite bool) {
 	log.Printf("[網址判斷] %s 未命中本機名單；正在呼叫 Gemma4", domain)
-	details, err := pythonCheckURLWithDetails(checker.root, target, checker.ollamaAPI)
+	details, err := pythonCheckURLWithContent(checker.root, target, checker.ollamaAPI, pageContent)
 	if err != nil {
 		if errors.Is(err, proxy.ErrUnknownDecision) {
 			reason = strings.TrimSpace(details.Reason)

@@ -9,7 +9,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -123,19 +122,27 @@ func handleHTTPConnection(connection net.Conn, reader *bufio.Reader, original st
 	if host == "" {
 		host = original
 	}
+	matchesDestination, err := requestHostMatchesDestination(host, original)
+	if err != nil {
+		log.Printf("[PROXY] cannot validate HTTP host %q for destination %s: %v", host, original, err)
+		writeBlockedHTTPResponse(connection, checker, "無法驗證 HTTP Host 與實際連線目的地，依安全規則封鎖。")
+		return
+	}
+	if !matchesDestination {
+		log.Printf("[PROXY] HTTP host %q does not match destination %s", host, original)
+		writeBlockedHTTPResponse(connection, checker, "HTTP Host 與實際連線目的地不一致，依安全規則封鎖。")
+		return
+	}
 	target := "http://" + host + request.URL.RequestURI()
-	allowed, reason, err := checkWithReason(checker, target)
-	if err != nil || !allowed {
-		if err != nil {
-			log.Printf("[PROXY] Check error for %s: %v (blocking)", target, err)
-		}
-		writeBlockedPage(connection, checker, reason)
+	if known, allowed, reason := knownDecision(checker, target); known && !allowed {
+		writeBlockedHTTPResponse(connection, checker, reason)
 		return
 	}
 
 	request.RequestURI = ""
 	request.URL.Scheme = "http"
 	request.URL.Host = host
+	request.Header.Del("Accept-Encoding")
 	request.Close = true
 	transport := &http.Transport{DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
 		return net.DialTimeout("tcp", original, 10*time.Second)
@@ -145,8 +152,10 @@ func handleHTTPConnection(connection net.Conn, reader *bufio.Reader, original st
 		writeProxyError(connection, http.StatusBadGateway, "upstream request failed")
 		return
 	}
-	defer response.Body.Close()
-	_ = response.Write(connection)
+	if err := inspectAndWriteResponse(connection, checker, target, response); err != nil {
+		log.Printf("[PROXY] failed to inspect %s: %v", target, err)
+		writeProxyError(connection, http.StatusBadGateway, "upstream response inspection failed")
+	}
 }
 
 func handleTLSConnection(connection net.Conn, reader *bufio.Reader, original string, checker URLChecker, ca *certificateAuthority) {
@@ -162,23 +171,27 @@ func handleTLSConnection(connection net.Conn, reader *bufio.Reader, original str
 		}
 		return
 	}
-	allowed, reason, err := checkWithReason(checker, "https://"+host)
-	if err != nil || !allowed {
-		if err != nil {
-			log.Printf("[PROXY] Check error for %s: %v (blocking)", host, err)
-		}
-		if err := serveBlockedTLSPage(connection, reader, checker, host, ca, reason); err != nil {
+	matchesDestination, err := requestHostMatchesDestination(host, original)
+	if err != nil {
+		log.Printf("[PROXY] cannot validate HTTPS SNI %q for destination %s: %v", host, original, err)
+		if err := serveBlockedTLSPage(connection, reader, checker, host, ca, "無法驗證 HTTPS SNI 與實際連線目的地，依安全規則封鎖。"); err != nil {
 			log.Printf("failed to render blocked TLS page for %s: %v", host, err)
 		}
 		return
 	}
-	upstream, err := net.DialTimeout("tcp", original, 10*time.Second)
-	if err != nil {
+	if !matchesDestination {
+		log.Printf("[PROXY] HTTPS SNI %q does not match destination %s", host, original)
+		if err := serveBlockedTLSPage(connection, reader, checker, host, ca, "HTTPS SNI 與實際連線目的地不一致，依安全規則封鎖。"); err != nil {
+			log.Printf("failed to render blocked TLS page for %s: %v", host, err)
+		}
 		return
 	}
-	defer upstream.Close()
-	go io.Copy(upstream, reader)
-	_, _ = io.Copy(connection, upstream)
+	dialContext := func(_ context.Context, _, _ string) (net.Conn, error) {
+		return net.DialTimeout("tcp", original, 10*time.Second)
+	}
+	if err := serveInspectedTLSConnection(connection, reader, host, checker, ca, dialContext); err != nil {
+		log.Printf("[PROXY] HTTPS inspection failed for %s: %v", host, err)
+	}
 }
 
 func serveBlockedTLSPage(connection net.Conn, reader *bufio.Reader, checker URLChecker, host string, ca *certificateAuthority, reason string) error {
